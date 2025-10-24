@@ -2,7 +2,7 @@ package com.kAIS.KAIMyEntity.renderer;
 
 import com.kAIS.KAIMyEntity.KAIMyEntityClient;
 import com.kAIS.KAIMyEntity.NativeFunc;
-import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGL;  // 추가
+import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGL;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -28,62 +28,101 @@ public class MMDModelManager {
         logger.info("MMDModelManager.Init() finished");
     }
 
+    /**
+     * 모델 로딩 - URDF, PMX, PMD 순서로 시도
+     */
     public static IMMDModel LoadModel(String modelName, long layerCount) {
-        //Model path
         File modelDir = new File(gameDirectory + "/KAIMyEntity/" + modelName);
         String modelDirStr = modelDir.getAbsolutePath();
 
-        // === URDF 지원 추가 ===
-        // URDF 파일이 있으면 URDF로 로드
-        File urdfModelFilename = new File(modelDir, "robot.urdf");
-        if (urdfModelFilename.isFile()) {
-            logger.info("Found URDF file for " + modelName + ", loading as URDF model...");
+        if (!modelDir.exists()) {
+            logger.error("✗ Model directory not found: " + modelDirStr);
+            return null;
+        }
+
+        // === 1. URDF 우선 시도 ===
+        File urdfFile = new File(modelDir, "robot.urdf");
+        if (urdfFile.isFile()) {
+            logger.info("Found URDF file for " + modelName + ", loading...");
             try {
                 IMMDModel urdfModel = URDFModelOpenGL.Create(
-                    urdfModelFilename.getAbsolutePath(), 
+                    urdfFile.getAbsolutePath(), 
                     modelDirStr
                 );
+                
                 if (urdfModel != null) {
-                    logger.info("✓ Successfully loaded URDF model: " + modelName);
+                    logger.info("✓ URDF model loaded successfully: " + modelName);
                     return urdfModel;
                 } else {
-                    logger.warn("Failed to load URDF model, will try PMX/PMD");
+                    logger.warn("✗ URDF model loading returned null");
                 }
             } catch (Exception e) {
-                logger.error("Error loading URDF model: " + e.getMessage(), e);
-                logger.warn("Falling back to PMX/PMD");
+                logger.error("✗ Exception loading URDF model: " + e.getMessage(), e);
             }
+            logger.warn("Falling back to PMX/PMD");
         }
-        // === URDF 지원 끝 ===
 
-        // 기존 PMX/PMD 로딩 로직 (그대로 유지)
-        String modelFilenameStr;
-        boolean isPMD;
-        File pmxModelFilename = new File(modelDir, "model.pmx");
-        if (pmxModelFilename.isFile()) {
-            modelFilenameStr = pmxModelFilename.getAbsolutePath();
-            isPMD = false;
-        } else {
-            File pmdModelFilename = new File(modelDir, "model.pmd");
-            if (pmdModelFilename.isFile()) {
-                modelFilenameStr = pmdModelFilename.getAbsolutePath();
-                isPMD = true;
-            } else {
-                return null;
+        // === 2. PMX 시도 ===
+        File pmxFile = new File(modelDir, "model.pmx");
+        if (pmxFile.isFile()) {
+            logger.info("Found PMX file for " + modelName);
+            IMMDModel mmdModel = MMDModelOpenGL.Create(
+                pmxFile.getAbsolutePath(), 
+                modelDirStr, 
+                false, // isPMD = false
+                layerCount
+            );
+            if (mmdModel != null) {
+                logger.info("✓ PMX model loaded successfully: " + modelName);
+                return mmdModel;
             }
         }
-        return MMDModelOpenGL.Create(modelFilenameStr, modelDirStr, isPMD, layerCount);
+
+        // === 3. PMD 시도 ===
+        File pmdFile = new File(modelDir, "model.pmd");
+        if (pmdFile.isFile()) {
+            logger.info("Found PMD file for " + modelName);
+            IMMDModel mmdModel = MMDModelOpenGL.Create(
+                pmdFile.getAbsolutePath(), 
+                modelDirStr, 
+                true, // isPMD = true
+                layerCount
+            );
+            if (mmdModel != null) {
+                logger.info("✓ PMD model loaded successfully: " + modelName);
+                return mmdModel;
+            }
+        }
+
+        logger.error("✗ No valid model found in " + modelDirStr);
+        logger.error("  Looked for: robot.urdf, model.pmx, model.pmd");
+        return null;
     }
 
+    /**
+     * 모델 가져오기 (캐시 포함)
+     */
     public static Model GetModel(String modelName, String uuid) {
-        Model model = models.get(modelName + uuid);
+        String fullName = modelName + uuid;
+        Model model = models.get(fullName);
+        
         if (model == null) {
             IMMDModel m = LoadModel(modelName, 3);
-            if (m == null)
+            if (m == null) {
                 return null;
-            MMDAnimManager.AddModel(m);
-            AddModel(modelName + uuid, m, modelName);
-            model = models.get(modelName + uuid);
+            }
+
+            // ✓ 모델 타입별 등록
+            if (m instanceof URDFModelOpenGL) {
+                RegisterURDFModel(fullName, m, modelName);
+            } else if (m instanceof MMDModelOpenGL) {
+                RegisterMMDModel(fullName, m, modelName);
+            } else {
+                logger.error("Unknown model type: " + m.getClass().getName());
+                return null;
+            }
+
+            model = models.get(fullName);
         }
         return model;
     }
@@ -92,23 +131,48 @@ public class MMDModelManager {
         return GetModel(modelName, "");
     }
 
-    public static void AddModel(String Name, IMMDModel model, String modelName) {
+    /**
+     * MMD 모델 등록 (기존 로직)
+     */
+    private static void RegisterMMDModel(String fullName, IMMDModel model, String modelName) {
         NativeFunc nf = NativeFunc.GetInst();
+        
         EntityData ed = new EntityData();
         ed.stateLayers = new EntityData.EntityState[3];
         ed.playCustomAnim = false;
         ed.rightHandMat = nf.CreateMat();
         ed.leftHandMat = nf.CreateMat();
-        ed.matBuffer = ByteBuffer.allocateDirect(64); //float * 16
+        ed.matBuffer = ByteBuffer.allocateDirect(64);
 
-        ModelWithEntityData m = new ModelWithEntityData();
-        m.entityName = Name;
+        MMDModelData m = new MMDModelData();
+        m.entityName = fullName;
         m.model = model;
         m.modelName = modelName;
         m.entityData = ed;
+        
+        // MMD 애니메이션 등록
+        MMDAnimManager.AddModel(model);
         model.ResetPhysics();
         model.ChangeAnim(MMDAnimManager.GetAnimModel(model, "idle"), 0);
-        models.put(Name, m);
+        
+        models.put(fullName, m);
+        logger.info("✓ MMD model registered: " + fullName);
+    }
+
+    /**
+     * URDF 모델 등록 (NativeFunc 의존성 제거)
+     */
+    private static void RegisterURDFModel(String fullName, IMMDModel model, String modelName) {
+        URDFModelData m = new URDFModelData();
+        m.entityName = fullName;
+        m.model = model;
+        m.modelName = modelName;
+        
+        // URDF는 애니메이션 없음
+        model.ResetPhysics(); // 조인트를 0으로 리셋
+        
+        models.put(fullName, m);
+        logger.info("✓ URDF model registered: " + fullName);
     }
 
     public static void ReloadModel() {
@@ -118,16 +182,19 @@ public class MMDModelManager {
     }
 
     static void DeleteModel(Model model) {
-        MMDModelOpenGL.Delete((MMDModelOpenGL) model.model);
-
-        //Unregister animation user
-        MMDAnimManager.DeleteModel(model.model);
+        if (model instanceof MMDModelData) {
+            MMDModelOpenGL mmdModel = (MMDModelOpenGL) model.model;
+            MMDModelOpenGL.Delete(mmdModel);
+            MMDAnimManager.DeleteModel(model.model);
+        }
+        // URDF는 네이티브 리소스 없으므로 삭제 불필요
     }
 
-    // === URDF 헬퍼 메서드 추가 ===
+    // ========== URDF 헬퍼 메서드 ==========
+    
     public static URDFModelOpenGL GetURDFModel(String modelName) {
         Model m = GetModel(modelName);
-        if (m != null && m.model instanceof URDFModelOpenGL) {
+        if (m instanceof URDFModelData && m.model instanceof URDFModelOpenGL) {
             return (URDFModelOpenGL) m.model;
         }
         return null;
@@ -139,12 +206,16 @@ public class MMDModelManager {
             urdfModel.updateJointPositions(jointPositions);
         }
     }
-    // === URDF 헬퍼 메서드 끝 ===
 
-    public static class Model {
+    // ========== 모델 클래스 계층 ==========
+
+    /**
+     * 기본 모델 클래스
+     */
+    public static abstract class Model {
         public IMMDModel model;
-        String entityName;
-        String modelName;
+        public String entityName;
+        public String modelName;
         public Properties properties = new Properties();
         boolean isPropertiesLoaded = false;
 
@@ -156,17 +227,43 @@ public class MMDModelManager {
                 InputStream istream = new FileInputStream(path2Properties);
                 properties.load(istream);
             } catch (IOException e) {
-                logger.warn( "KAIMyEntity/" + modelName + "/model.properties not found" );
+                logger.debug("model.properties not found for " + modelName);
             }
             isPropertiesLoaded = true;
             KAIMyEntityClient.reloadProperties = false;
-        } 
+        }
+        
+        public abstract boolean isMMDModel();
+        public abstract boolean isURDFModel();
     }
 
-    public static class ModelWithEntityData extends Model {
+    /**
+     * MMD 모델 (PMX/PMD)
+     */
+    public static class MMDModelData extends Model {
         public EntityData entityData;
+        
+        @Override
+        public boolean isMMDModel() { return true; }
+        
+        @Override
+        public boolean isURDFModel() { return false; }
     }
 
+    /**
+     * URDF 모델
+     */
+    public static class URDFModelData extends Model {
+        @Override
+        public boolean isMMDModel() { return false; }
+        
+        @Override
+        public boolean isURDFModel() { return true; }
+    }
+
+    /**
+     * 엔티티 상태 데이터 (MMD 전용)
+     */
     public static class EntityData {
         public static HashMap<EntityState, String> stateProperty = new HashMap<>() {{
             put(EntityState.Idle, "idle");
@@ -190,11 +287,16 @@ public class MMDModelManager {
             put(EntityState.Crawl, "crawl");
             put(EntityState.LieDown, "lieDown");
         }};
-        public boolean playCustomAnim; //Custom animation played in layer 0.
+        
+        public boolean playCustomAnim;
         public long rightHandMat, leftHandMat;
         public EntityState[] stateLayers;
         ByteBuffer matBuffer;
 
-        public enum EntityState {Idle, Walk, Sprint, Air, OnClimbable, OnClimbableUp, OnClimbableDown, Swim, Ride, Ridden, Driven, Sleep, ElytraFly, Die, SwingRight, SwingLeft, ItemRight, ItemLeft, Sneak, OnHorse, Crawl, LieDown}
+        public enum EntityState {
+            Idle, Walk, Sprint, Air, OnClimbable, OnClimbableUp, OnClimbableDown, 
+            Swim, Ride, Ridden, Driven, Sleep, ElytraFly, Die, SwingRight, SwingLeft, 
+            ItemRight, ItemLeft, Sneak, OnHorse, Crawl, LieDown
+        }
     }
 }
