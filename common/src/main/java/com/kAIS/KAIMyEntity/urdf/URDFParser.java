@@ -14,10 +14,14 @@ import java.io.File;
 
 public class URDFParser {
     private static final Logger logger = LogManager.getLogger();
+    private static File baseDir; // URDF 파일이 있는 디렉토리
     
     public static URDFRobotModel parse(File urdfFile) {
         try {
-            logger.info("Parsing URDF file: " + urdfFile.getAbsolutePath());
+            baseDir = urdfFile.getParentFile();
+            logger.info("=== URDF Parsing Start ===");
+            logger.info("File: " + urdfFile.getAbsolutePath());
+            logger.info("Base directory: " + baseDir.getAbsolutePath());
             
             DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
             DocumentBuilder builder = factory.newDocumentBuilder();
@@ -31,38 +35,104 @@ public class URDFParser {
             
             // Parse all links
             NodeList linkNodes = robotElement.getElementsByTagName("link");
+            logger.info("Found " + linkNodes.getLength() + " links");
             for (int i = 0; i < linkNodes.getLength(); i++) {
                 Node node = linkNodes.item(i);
                 if (node.getNodeType() == Node.ELEMENT_NODE) {
                     URDFLink link = parseLink((Element) node);
                     if (link != null) {
                         robot.addLink(link);
+                        logger.debug("  + Link: " + link.name);
                     }
                 }
             }
             
             // Parse all joints
             NodeList jointNodes = robotElement.getElementsByTagName("joint");
+            logger.info("Found " + jointNodes.getLength() + " joints");
             for (int i = 0; i < jointNodes.getLength(); i++) {
                 Node node = jointNodes.item(i);
                 if (node.getNodeType() == Node.ELEMENT_NODE) {
                     URDFJoint joint = parseJoint((Element) node);
                     if (joint != null) {
                         robot.addJoint(joint);
+                        logger.debug("  + Joint: " + joint.name + " (" + joint.type + ")");
                     }
                 }
             }
             
             robot.buildHierarchy();
             
-            logger.info("URDF parsing complete: " + robot.toString());
+            // ✓ 루트 링크 검증
+            if (robot.rootLinkName == null || robot.getLink(robot.rootLinkName) == null) {
+                logger.error("✗ No valid root link found!");
+                logger.error("  Check parent/child relationships in joints");
+                return null;
+            }
+            
+            logger.info("=== URDF Parsing Complete ===");
+            logger.info("  Robot: " + robot.name);
+            logger.info("  Links: " + robot.getLinkCount());
+            logger.info("  Joints: " + robot.getJointCount());
+            logger.info("  Movable Joints: " + robot.getMovableJointCount());
+            logger.info("  Root Link: " + robot.rootLinkName);
+            
             return robot;
             
         } catch (Exception e) {
-            logger.error("Failed to parse URDF file: " + urdfFile.getAbsolutePath(), e);
+            logger.error("✗ Failed to parse URDF file: " + urdfFile.getAbsolutePath(), e);
             return null;
         }
     }
+    
+    // ========== 메시 경로 해석 ==========
+    
+    private static String resolveMeshPath(String uri) {
+        if (uri == null || uri.isEmpty()) {
+            return null;
+        }
+        
+        // file:// 스킴
+        if (uri.startsWith("file://")) {
+            try {
+                return new java.net.URI(uri).getPath();
+            } catch (Exception e) {
+                logger.warn("Invalid file:// URI: " + uri);
+                return null;
+            }
+        }
+        
+        // package:// 스킴 (ROS 표준)
+        if (uri.startsWith("package://")) {
+            String withoutScheme = uri.substring("package://".length());
+            int slash = withoutScheme.indexOf('/');
+            String relativePath = (slash >= 0) ? withoutScheme.substring(slash + 1) : withoutScheme;
+            
+            File resolved = new File(baseDir, relativePath);
+            if (!resolved.exists()) {
+                logger.warn("Mesh not found: " + uri + " -> " + resolved.getAbsolutePath());
+            }
+            return resolved.getAbsolutePath();
+        }
+        
+        // 절대 경로
+        File f = new File(uri);
+        if (f.isAbsolute()) {
+            if (!f.exists()) {
+                logger.warn("Absolute mesh path not found: " + uri);
+            }
+            return f.getAbsolutePath();
+        }
+        
+        // 상대 경로 (baseDir 기준)
+        File resolved = new File(baseDir, uri);
+        if (!resolved.exists()) {
+            logger.warn("Relative mesh path not found: " + uri);
+        }
+        return resolved.getAbsolutePath();
+    }
+    
+    // ========== 파싱 메서드들 ==========
     
     private static URDFLink parseLink(Element linkElement) {
         String name = linkElement.getAttribute("name");
@@ -116,13 +186,11 @@ public class URDFParser {
     private static URDFLink.Collision parseCollision(Element collisionElement) {
         URDFLink.Collision collision = new URDFLink.Collision();
         
-        // Parse origin
         NodeList originNodes = collisionElement.getElementsByTagName("origin");
         if (originNodes.getLength() > 0) {
             collision.origin = parseOrigin((Element) originNodes.item(0));
         }
         
-        // Parse geometry
         NodeList geometryNodes = collisionElement.getElementsByTagName("geometry");
         if (geometryNodes.getLength() > 0) {
             collision.geometry = parseGeometry((Element) geometryNodes.item(0));
@@ -134,20 +202,17 @@ public class URDFParser {
     private static URDFLink.Inertial parseInertial(Element inertialElement) {
         URDFLink.Inertial inertial = new URDFLink.Inertial();
         
-        // Parse origin
         NodeList originNodes = inertialElement.getElementsByTagName("origin");
         if (originNodes.getLength() > 0) {
             inertial.origin = parseOrigin((Element) originNodes.item(0));
         }
         
-        // Parse mass
         NodeList massNodes = inertialElement.getElementsByTagName("mass");
         if (massNodes.getLength() > 0) {
             inertial.mass = new URDFLink.Inertial.Mass();
             inertial.mass.value = Float.parseFloat(((Element) massNodes.item(0)).getAttribute("value"));
         }
         
-        // Parse inertia
         NodeList inertiaNodes = inertialElement.getElementsByTagName("inertia");
         if (inertiaNodes.getLength() > 0) {
             Element inertiaEl = (Element) inertiaNodes.item(0);
@@ -171,13 +236,25 @@ public class URDFParser {
         if (meshNodes.getLength() > 0) {
             Element meshEl = (Element) meshNodes.item(0);
             geometry.type = URDFLink.Geometry.GeometryType.MESH;
-            geometry.meshFilename = meshEl.getAttribute("filename");
             
-            // Parse scale if present
-            if (meshEl.hasAttribute("scale")) {
-                String scaleStr = meshEl.getAttribute("scale");
-                geometry.scale = parseVector3(scaleStr);
+            String rawUri = meshEl.getAttribute("filename");
+            String resolved = resolveMeshPath(rawUri);
+            
+            if (resolved != null) {
+                geometry.meshFilename = resolved;
+                logger.debug("Mesh resolved: " + rawUri + " -> " + resolved);
+            } else {
+                logger.warn("Failed to resolve mesh: " + rawUri);
+                geometry.meshFilename = rawUri; // 원본 저장
             }
+            
+            // Parse scale
+            if (meshEl.hasAttribute("scale")) {
+                geometry.scale = parseVector3(meshEl.getAttribute("scale"));
+            } else {
+                geometry.scale = new Vector3f(1f, 1f, 1f);
+            }
+            
             return geometry;
         }
         
@@ -209,6 +286,7 @@ public class URDFParser {
             return geometry;
         }
         
+        logger.warn("No geometry found in element");
         return geometry;
     }
     
@@ -285,6 +363,7 @@ public class URDFParser {
         // Parse origin
         NodeList originNodes = jointElement.getElementsByTagName("origin");
         if (originNodes.getLength() > 0) {
+            if (joint.origin == null) joint.origin = new URDFJoint.Origin();
             Element originEl = (Element) originNodes.item(0);
             if (originEl.hasAttribute("xyz")) {
                 joint.origin.xyz = parseVector3(originEl.getAttribute("xyz"));
@@ -294,12 +373,40 @@ public class URDFParser {
             }
         }
         
-        // Parse axis
+        // ✓ Parse axis with URDF defaults
         NodeList axisNodes = jointElement.getElementsByTagName("axis");
+        Vector3f axis = null;
+        
         if (axisNodes.getLength() > 0) {
             Element axisEl = (Element) axisNodes.item(0);
-            joint.axis.xyz = parseVector3(axisEl.getAttribute("xyz"));
-            joint.axis.normalize();
+            axis = parseVector3(axisEl.getAttribute("xyz"));
+        } else {
+            // URDF 표준: axis 없으면 타입별 기본값
+            switch (type) {
+                case REVOLUTE:
+                case CONTINUOUS:
+                case PRISMATIC:
+                    axis = new Vector3f(1, 0, 0); // X축
+                    logger.debug("Joint '" + name + "': using default axis (1,0,0)");
+                    break;
+                default:
+                    axis = new Vector3f(0, 0, 0); // FIXED 등
+            }
+        }
+        
+        if (joint.axis == null) joint.axis = new URDFJoint.Axis();
+        joint.axis.xyz = axis;
+        
+        // ✓ 0벡터 정규화 방지
+        if (axis.lengthSquared() > 1e-12f) {
+            axis.normalize();
+        } else {
+            if (type == URDFJoint.JointType.REVOLUTE || 
+                type == URDFJoint.JointType.CONTINUOUS || 
+                type == URDFJoint.JointType.PRISMATIC) {
+                logger.warn("Joint '" + name + "' has zero axis; using (1,0,0) fallback");
+                joint.axis.xyz.set(1, 0, 0);
+            }
         }
         
         // Parse limit
@@ -348,6 +455,7 @@ public class URDFParser {
                 Float.parseFloat(parts[2])
             );
         }
+        logger.warn("Invalid Vector3 string: " + str);
         return new Vector3f(0.0f, 0.0f, 0.0f);
     }
 }
