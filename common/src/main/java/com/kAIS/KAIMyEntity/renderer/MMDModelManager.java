@@ -45,7 +45,8 @@ public class MMDModelManager {
         if (urdfFile.isFile()) {
             logger.info("Found URDF file for " + modelName + ", loading...");
             try {
-                IMMDModel urdfModel = URDFModelOpenGL.Create(
+                // ⭐ 여기만 바뀜! URDFModelOpenGLWithSTL 사용
+                IMMDModel urdfModel = com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL.Create(
                     urdfFile.getAbsolutePath(), 
                     modelDirStr
                 );
