@@ -114,6 +114,9 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         
     public static URDFModelOpenGLWithSTL Create(String urdfPath, String modelDir) {
         logger.info("=== Creating URDF Renderer ===");
-        
+        logger.info("
+
+
+            
         
     
