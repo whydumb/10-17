@@ -18,7 +18,7 @@ import org.joml.Vector3f;
 import java.io.File;
 
 /**
- * URDF 모델 렌더링 + STL 메시 지원
+ * URDF 모델 렌더링 (완전한 Vertex 데이터)
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -35,73 +35,138 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
 
     @Override
     public void Render(Entity entityIn, float entityYaw, float entityPitch,
-                       Vector3f entityTrans, float tickDelta, PoseStack mat, int packedLight) {
+                       Vector3f entityTrans, float tickDelta, PoseStack poseStack, int packedLight) {
 
         renderCount++;
         logger.info("=== URDF RENDER CALLED #" + renderCount + " ===");
-        logger.info("Entity: " + entityIn.getName().getString());
 
-        // 기본 렌더 상태
+        // 렌더 상태 설정
         RenderSystem.enableBlend();
         RenderSystem.defaultBlendFunc();
         RenderSystem.enableDepthTest();
         RenderSystem.disableCull();
 
-        // 안전한 버텍스 경로 (버전 차이에 둔감)
+        // 버퍼 가져오기
         MultiBufferSource.BufferSource bufferSource = Minecraft.getInstance().renderBuffers().bufferSource();
         VertexConsumer vc = bufferSource.getBuffer(RenderType.solid());
 
-        Matrix4f matrix = mat.last().pose();
+        Matrix4f matrix = poseStack.last().pose();
         float size = 1.0f;
-        float r = 1.0f, g = 0.0f, b = 0.0f, a = 1.0f;
+        
+        // 색상 (RGBA 0-255)
+        int red = 255, green = 0, blue = 0, alpha = 255;
+        
+        // ===== 육면체 렌더링 (각 면마다 4개 정점 + Normal) =====
+        
+        // Front face (+Z) - Normal: (0, 0, 1)
+        addQuad(vc, matrix,
+            -size, 0f,    size,  // v1
+             size, 0f,    size,  // v2
+             size, 2*size, size,  // v3
+            -size, 2*size, size,  // v4
+            0, 0, 1,  // normal
+            red, green, blue, alpha, packedLight);
+        
+        // Back face (-Z) - Normal: (0, 0, -1)
+        addQuad(vc, matrix,
+             size, 0f,   -size,
+            -size, 0f,   -size,
+            -size, 2*size,-size,
+             size, 2*size,-size,
+            0, 0, -1,
+            red, green, blue, alpha, packedLight);
+        
+        // Top face (+Y) - Normal: (0, 1, 0)
+        addQuad(vc, matrix,
+            -size, 2*size, -size,
+            -size, 2*size,  size,
+             size, 2*size,  size,
+             size, 2*size, -size,
+            0, 1, 0,
+            red, green, blue, alpha, packedLight);
+        
+        // Bottom face (-Y) - Normal: (0, -1, 0)
+        addQuad(vc, matrix,
+            -size, 0f,    size,
+            -size, 0f,   -size,
+             size, 0f,   -size,
+             size, 0f,    size,
+            0, -1, 0,
+            red, green, blue, alpha, packedLight);
+        
+        // Right face (+X) - Normal: (1, 0, 0)
+        addQuad(vc, matrix,
+             size, 0f,    size,
+             size, 0f,   -size,
+             size, 2*size,-size,
+             size, 2*size, size,
+            1, 0, 0,
+            red, green, blue, alpha, packedLight);
+        
+        // Left face (-X) - Normal: (-1, 0, 0)
+        addQuad(vc, matrix,
+            -size, 0f,   -size,
+            -size, 0f,    size,
+            -size, 2*size, size,
+            -size, 2*size,-size,
+            -1, 0, 0,
+            red, green, blue, alpha, packedLight);
 
-        // 6면 박스
-        // Front (+Z)
-        vc.vertex(matrix, -size, 0f,    size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 0f,    size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 2*size, size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 2*size, size).color(r, g, b, a).endVertex();
-
-        // Back (-Z)
-        vc.vertex(matrix,  size, 0f,   -size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 0f,   -size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 2*size,-size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 2*size,-size).color(r, g, b, a).endVertex();
-
-        // Top (+Y)
-        vc.vertex(matrix, -size, 2*size, -size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 2*size,  size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 2*size,  size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 2*size, -size).color(r, g, b, a).endVertex();
-
-        // Bottom (Y=0)
-        vc.vertex(matrix, -size, 0f,    size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 0f,   -size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 0f,   -size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 0f,    size).color(r, g, b, a).endVertex();
-
-        // Right (+X)
-        vc.vertex(matrix,  size, 0f,    size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 0f,   -size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 2*size,-size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix,  size, 2*size, size).color(r, g, b, a).endVertex();
-
-        // Left (-X)
-        vc.vertex(matrix, -size, 0f,   -size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 0f,    size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 2*size, size).color(r, g, b, a).endVertex();
-        vc.vertex(matrix, -size, 2*size,-size).color(r, g, b, a).endVertex();
-
-        // 해당 RenderType만 플러시
+        // 버퍼 플러시
         bufferSource.endBatch(RenderType.solid());
 
         RenderSystem.enableCull();
-        logger.info("Red Box render done");
+        logger.info("✓ Red Box rendered");
+    }
+    
+    /**
+     * 사각형 추가 (4개 정점 + 법선)
+     */
+    private void addQuad(VertexConsumer vc, Matrix4f matrix,
+                         float x1, float y1, float z1,
+                         float x2, float y2, float z2,
+                         float x3, float y3, float z3,
+                         float x4, float y4, float z4,
+                         float nx, float ny, float nz,
+                         int r, int g, int b, int a,
+                         int light) {
+        
+        // Light를 UV2로 변환 (Minecraft 1.21 형식)
+        int lightU = light & 0xFFFF;        // Block light
+        int lightV = (light >> 16) & 0xFFFF; // Sky light
+        
+        // Vertex 1
+        vc.addVertex(matrix, x1, y1, z1)
+          .setColor(r, g, b, a)
+          .setUv(0f, 0f)
+          .setUv2(lightU, lightV)
+          .setNormal(nx, ny, nz);
+        
+        // Vertex 2
+        vc.addVertex(matrix, x2, y2, z2)
+          .setColor(r, g, b, a)
+          .setUv(1f, 0f)
+          .setUv2(lightU, lightV)
+          .setNormal(nx, ny, nz);
+        
+        // Vertex 3
+        vc.addVertex(matrix, x3, y3, z3)
+          .setColor(r, g, b, a)
+          .setUv(1f, 1f)
+          .setUv2(lightU, lightV)
+          .setNormal(nx, ny, nz);
+        
+        // Vertex 4
+        vc.addVertex(matrix, x4, y4, z4)
+          .setColor(r, g, b, a)
+          .setUv(0f, 1f)
+          .setUv2(lightU, lightV)
+          .setNormal(nx, ny, nz);
     }
 
     @Override
     public void ChangeAnim(long anim, long layer) {
-        // 암것도 안함
+        // URDF는 애니메이션 없음
     }
 
     @Override
