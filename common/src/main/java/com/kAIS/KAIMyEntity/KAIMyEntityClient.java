@@ -1,8 +1,7 @@
-
 package com.kAIS.KAIMyEntity;
 
 import com.kAIS.KAIMyEntity.renderer.MMDModelManager;
-import com.kAIS.KAIMyEntity.renderer.MMDTextureManager;
+// import com.kAIS.KAIMyEntity.renderer.MMDTextureManager;  // ← 이미 삭제됨
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.File;
@@ -28,8 +27,8 @@ public class KAIMyEntityClient {
 
     public static void initClient() {
         checkKAIMyEntityFolder();
-       // MMDModelManager.Init();
-        //MMDTextureManager.Init();
+        MMDModelManager.Init();  // ✅ 이 줄 주석 해제!
+        // MMDTextureManager.Init();  // ← 이건 계속 주석
         logger.info("KAIMyEntityClient initialized (URDF only)");
     }
 
@@ -95,7 +94,6 @@ public class KAIMyEntityClient {
         if (!KAIMyEntityFolder.exists()){
             logger.info("KAIMyEntity folder not found, creating...");
             KAIMyEntityFolder.mkdir();
-            // URDF는 다운로드 안 함
         }
         return;
     }
