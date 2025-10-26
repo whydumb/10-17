@@ -85,51 +85,141 @@ public class URDFParser {
         }
     }
     
-    // ========== 메시 경로 해석 ==========
+    // ========== 메시 경로 해석 (개선) ==========
     
     private static String resolveMeshPath(String uri) {
         if (uri == null || uri.isEmpty()) {
             return null;
         }
         
-        // file:// 스킴
+        logger.debug("Resolving mesh URI: " + uri);
+        
+        // 1. file:// 스킴
         if (uri.startsWith("file://")) {
             try {
-                return new java.net.URI(uri).getPath();
+                String path = new java.net.URI(uri).getPath();
+                File f = new File(path);
+                if (f.exists()) {
+                    logger.debug("  -> file:// resolved: " + f.getAbsolutePath());
+                    return f.getAbsolutePath();
+                } else {
+                    logger.warn("  -> file:// path not found: " + path);
+                    return null;
+                }
             } catch (Exception e) {
                 logger.warn("Invalid file:// URI: " + uri);
                 return null;
             }
         }
         
-        // package:// 스킴 (ROS 표준)
+        // 2. package:// 스킴 (ROS 표준)
         if (uri.startsWith("package://")) {
             String withoutScheme = uri.substring("package://".length());
             int slash = withoutScheme.indexOf('/');
             String relativePath = (slash >= 0) ? withoutScheme.substring(slash + 1) : withoutScheme;
             
             File resolved = new File(baseDir, relativePath);
-            if (!resolved.exists()) {
-                logger.warn("Mesh not found: " + uri + " -> " + resolved.getAbsolutePath());
+            if (resolved.exists()) {
+                logger.debug("  -> package:// resolved: " + resolved.getAbsolutePath());
+                return resolved.getAbsolutePath();
+            } else {
+                logger.warn("  -> package:// not found: " + resolved.getAbsolutePath());
+                // Fallback: meshes/ 폴더에서 찾기
+                File meshDir = new File(baseDir, "meshes");
+                File fallback = new File(meshDir, new File(relativePath).getName());
+                if (fallback.exists()) {
+                    logger.info("  -> Found in meshes/: " + fallback.getAbsolutePath());
+                    return fallback.getAbsolutePath();
+                }
+                return null;
             }
+        }
+        
+        // 3. 절대 경로
+        File f = new File(uri);
+        if (f.isAbsolute()) {
+            if (f.exists()) {
+                logger.debug("  -> absolute path: " + f.getAbsolutePath());
+                return f.getAbsolutePath();
+            } else {
+                logger.warn("  -> absolute path not found: " + uri);
+                return null;
+            }
+        }
+        
+        // 4. 상대 경로 (baseDir 기준)
+        File resolved = new File(baseDir, uri);
+        if (resolved.exists()) {
+            logger.debug("  -> relative to baseDir: " + resolved.getAbsolutePath());
             return resolved.getAbsolutePath();
         }
         
-        // 절대 경로
-        File f = new File(uri);
-        if (f.isAbsolute()) {
-            if (!f.exists()) {
-                logger.warn("Absolute mesh path not found: " + uri);
+        // 5. Fallback: meshes/ 폴더에서 파일명만으로 찾기
+        String filename = new File(uri).getName();
+        File meshDir = new File(baseDir, "meshes");
+        
+        // meshes/ 폴더 자체가 없으면 생성하지 않고 경고만
+        if (meshDir.exists() && meshDir.isDirectory()) {
+            File meshFile = new File(meshDir, filename);
+            if (meshFile.exists()) {
+                logger.info("  -> Found by filename in meshes/: " + meshFile.getAbsolutePath());
+                return meshFile.getAbsolutePath();
             }
-            return f.getAbsolutePath();
+            
+            // 대소문자 무시하고 찾기 (Windows 호환성)
+            File[] meshFiles = meshDir.listFiles();
+            if (meshFiles != null) {
+                for (File candidate : meshFiles) {
+                    if (candidate.getName().equalsIgnoreCase(filename)) {
+                        logger.info("  -> Found by case-insensitive search: " + candidate.getAbsolutePath());
+                        return candidate.getAbsolutePath();
+                    }
+                }
+            }
         }
         
-        // 상대 경로 (baseDir 기준)
-        File resolved = new File(baseDir, uri);
-        if (!resolved.exists()) {
-            logger.warn("Relative mesh path not found: " + uri);
+        // 6. 최종 Fallback: 하위 디렉토리 재귀 검색
+        File found = searchFileRecursive(baseDir, filename, 2);
+        if (found != null) {
+            logger.info("  -> Found by recursive search: " + found.getAbsolutePath());
+            return found.getAbsolutePath();
         }
-        return resolved.getAbsolutePath();
+        
+        logger.warn("  -> Could not resolve mesh: " + uri);
+        return null;
+    }
+    
+    /**
+     * 파일을 재귀적으로 검색 (최대 깊이 제한)
+     */
+    private static File searchFileRecursive(File directory, String filename, int maxDepth) {
+        if (maxDepth <= 0 || !directory.isDirectory()) {
+            return null;
+        }
+        
+        File[] files = directory.listFiles();
+        if (files == null) {
+            return null;
+        }
+        
+        // 현재 디렉토리에서 검색
+        for (File file : files) {
+            if (file.isFile() && file.getName().equalsIgnoreCase(filename)) {
+                return file;
+            }
+        }
+        
+        // 하위 디렉토리 재귀 검색
+        for (File file : files) {
+            if (file.isDirectory() && !file.getName().startsWith(".")) {
+                File found = searchFileRecursive(file, filename, maxDepth - 1);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        
+        return null;
     }
     
     // ========== 파싱 메서드들 ==========
@@ -242,9 +332,9 @@ public class URDFParser {
             
             if (resolved != null) {
                 geometry.meshFilename = resolved;
-                logger.debug("Mesh resolved: " + rawUri + " -> " + resolved);
+                logger.debug("✓ Mesh resolved: " + new File(resolved).getName());
             } else {
-                logger.warn("Failed to resolve mesh: " + rawUri);
+                logger.warn("✗ Failed to resolve mesh: " + rawUri);
                 geometry.meshFilename = rawUri; // 원본 저장
             }
             
