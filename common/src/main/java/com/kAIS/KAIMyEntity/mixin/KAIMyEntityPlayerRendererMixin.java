@@ -1,4 +1,3 @@
-KAIMyEntityPlayerRendererMixin.java:
 package com.kAIS.KAIMyEntity.mixin;
 
 import com.kAIS.KAIMyEntity.renderer.IMMDModel;
