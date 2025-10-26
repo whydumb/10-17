@@ -2,9 +2,14 @@ package com.kAIS.KAIMyEntity.urdf;
 
 import com.kAIS.KAIMyEntity.renderer.IMMDModel;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vertex.*;
-import net.minecraft.client.renderer.GameRenderer;
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.blaze3d.vertex.VertexConsumer;
+
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.RenderType;
 import net.minecraft.world.entity.Entity;
+
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.joml.Matrix4f;
@@ -18,7 +23,7 @@ import java.io.File;
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
     private static int renderCount = 0;
-    
+
     private URDFRobotModel robotModel;
     private String modelDir;
 
@@ -26,7 +31,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         this.robotModel = robotModel;
         this.modelDir = modelDir;
         logger.info("=== URDF renderer Created ===");
-        
     }
 
     @Override
@@ -34,61 +38,64 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                        Vector3f entityTrans, float tickDelta, PoseStack mat, int packedLight) {
 
         renderCount++;
-
         logger.info("=== URDF RENDER CALLED #" + renderCount + " ===");
         logger.info("Entity: " + entityIn.getName().getString());
 
-        //
+        // 기본 렌더 상태
         RenderSystem.enableBlend();
         RenderSystem.defaultBlendFunc();
         RenderSystem.enableDepthTest();
-        RenderSystem.disableDull();
+        RenderSystem.disableCull();
 
-        Tesselater tesselator = Tesselator.getInstance();
-        BufferBuilder bufferBuilder = tesselator.begin(
-            VertexFormat.Mode.QUADS,
-            DefaultVertexFormat.POSITION_COLOR
-        );
+        // 안전한 버텍스 경로 (버전 차이에 둔감)
+        MultiBufferSource.BufferSource bufferSource = Minecraft.getInstance().renderBuffers().bufferSource();
+        VertexConsumer vc = bufferSource.getBuffer(RenderType.solid());
 
         Matrix4f matrix = mat.last().pose();
         float size = 1.0f;
         float r = 1.0f, g = 0.0f, b = 0.0f, a = 1.0f;
 
-
         // 6면 박스
-        // Front
-        bufferBuilder.addVertex(matrix, -size, 0, size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 0, size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 2*size, size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, -size, 2*size, size).setColor(r, g, b, a);
+        // Front (+Z)
+        vc.vertex(matrix, -size, 0f,    size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 0f,    size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 2*size, size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 2*size, size).color(r, g, b, a).endVertex();
 
-        //back
-        bufferBuilder.addVertex(matrix, size, 0, -size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, -size, 0, -size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, -size, 2*size, -size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 2*size, -size).setColor(r, g, b, a);
+        // Back (-Z)
+        vc.vertex(matrix,  size, 0f,   -size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 0f,   -size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 2*size,-size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 2*size,-size).color(r, g, b, a).endVertex();
 
-        //Top
-        bufferBuilder.addVertex(matrix, -size, 2*size, -size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, -size, 2*size, size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 2*size, size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 2*size, -size).setColor(r, g, b, a);
+        // Top (+Y)
+        vc.vertex(matrix, -size, 2*size, -size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 2*size,  size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 2*size,  size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 2*size, -size).color(r, g, b, a).endVertex();
 
-        //Bottom 
-        bufferBuilder.addVertex(matrix, -size, 0, size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, -size, 0, -size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 0, -size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 0, size).setColor(r, g, b, a);
+        // Bottom (Y=0)
+        vc.vertex(matrix, -size, 0f,    size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 0f,   -size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 0f,   -size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 0f,    size).color(r, g, b, a).endVertex();
 
-        //RIght
-        bufferBuilder.addVertex(matrix, size, 0, size).setColor(r, g, b, a);
-        bufferBuilder.addVertex(matrix, size, 0, -size).setColor(r, g, b, a);
-        bufferBuilder.addvertex(matrix, size, 2*size, -size).setColor(r, g, b, a);
-        bufferBuilder.addvertex(matrix, size, 2*size, size).setColor(r, g, b, a);
-        
-        BufferUploader.darwWithSharder(bufferBuilder.buildOrThrow());
+        // Right (+X)
+        vc.vertex(matrix,  size, 0f,    size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 0f,   -size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 2*size,-size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix,  size, 2*size, size).color(r, g, b, a).endVertex();
+
+        // Left (-X)
+        vc.vertex(matrix, -size, 0f,   -size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 0f,    size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 2*size, size).color(r, g, b, a).endVertex();
+        vc.vertex(matrix, -size, 2*size,-size).color(r, g, b, a).endVertex();
+
+        // 해당 RenderType만 플러시
+        bufferSource.endBatch(RenderType.solid());
+
         RenderSystem.enableCull();
-
         logger.info("Red Box render done");
     }
 
@@ -111,7 +118,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     public String GetModelDir() {
         return modelDir;
     }
-        
+
     public static URDFModelOpenGLWithSTL Create(String urdfPath, String modelDir) {
         logger.info("=== Creating URDF Renderer ===");
         logger.info("URDF: " + urdfPath);
@@ -132,7 +139,3 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         return new URDFModelOpenGLWithSTL(robot, modelDir);
     }
 }
-
-            
-        
-    
