@@ -112,7 +112,7 @@ public class MMDModelManager {
                 // properties 없어도 OK
             }
             isPropertiesLoaded = true;
-            KAIMyEntityClient.reloadProperties = false;
+ //           KAIMyEntityClient.reloadProperties = false;
         }
         
         public boolean isURDFModel() { return true; }
