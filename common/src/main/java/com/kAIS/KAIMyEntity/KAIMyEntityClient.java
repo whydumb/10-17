@@ -28,8 +28,8 @@ public class KAIMyEntityClient {
 
     public static void initClient() {
         checkKAIMyEntityFolder();
-        MMDModelManager.Init();
-        MMDTextureManager.Init();
+       // MMDModelManager.Init();
+        //MMDTextureManager.Init();
         logger.info("KAIMyEntityClient initialized (URDF only)");
     }
 
