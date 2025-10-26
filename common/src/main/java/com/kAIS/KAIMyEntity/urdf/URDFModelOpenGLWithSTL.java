@@ -114,8 +114,24 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         
     public static URDFModelOpenGLWithSTL Create(String urdfPath, String modelDir) {
         logger.info("=== Creating URDF Renderer ===");
-        logger.info("
+        logger.info("URDF: " + urdfPath);
 
+        File urdfFile = new File(urdfPath);
+        if (!urdfFile.exists()) {
+            logger.error("URDF not found!");
+            return null;
+        }
+
+        URDFRobotModel robot = URDFParser.parse(urdfFile);
+        if (robot == null || robot.rootLinkName == null) {
+            logger.error("URDF parse failed!");
+            return null;
+        }
+
+        logger.info("✓ URDF Renderer created");
+        return new URDFModelOpenGLWithSTL(robot, modelDir);
+    }
+}
 
             
         
