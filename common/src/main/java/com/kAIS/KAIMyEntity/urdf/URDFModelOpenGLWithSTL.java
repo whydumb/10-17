@@ -117,6 +117,9 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             // 전역 스케일 적용
             poseStack.scale(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
             
+            // ROS (Z-up) → Minecraft (Y-up) 변환
+            poseStack.mulPose(new Quaternionf().rotateX((float)(-Math.PI / 2)));
+            
             renderLinkRecursive(robotModel.rootLinkName, poseStack, vc, packedLight);
             poseStack.popPose();
         }
@@ -190,7 +193,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         Matrix4f matrix = poseStack.last().pose();
         
         // 색상 결정 (material에서 가져오거나 기본값)
-        int r = 200, g = 200, b = 200, a = 255;
+        int r = 220, g = 220, b = 220, a = 255;
         
         if (link.visual.material != null && link.visual.material.color != null) {
             URDFLink.Material.Vector4f color = link.visual.material.color;
@@ -200,14 +203,18 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             a = (int)(color.w * 255);
         }
         
-        // 조명을 최대로 설정 (어둡지 않게)
-        int fullBright = 0xF000F0;  // 최대 밝기
-        int lightU = fullBright & 0xFFFF;
-        int lightV = (fullBright >> 16) & 0xFFFF;
+        // 조명 개선
+        int blockLight = (packedLight & 0xFFFF);
+        int skyLight = (packedLight >> 16) & 0xFFFF;
+        
+        // 최소 밝기 보장
+        blockLight = Math.max(blockLight, 0xA0);
+        skyLight = Math.max(skyLight, 0xA0);
         
         // 모든 삼각형 렌더링
         for (STLLoader.Triangle tri : mesh.triangles) {
-            for (int i = 0; i < 3; i++) {
+            // 버텍스 순서 반전 (컬링 문제 해결)
+            for (int i = 2; i >= 0; i--) {
                 Vector3f v = tri.vertices[i];
                 Vector3f n = tri.normal;
                 
@@ -218,8 +225,8 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                 
                 vc.addVertex(matrix, v.x, v.y, v.z)
                   .setColor(r, g, b, a)
-                  .setUv(0f, 0f)
-                  .setUv2(lightU, lightV)
+                  .setUv(0.5f, 0.5f)
+                  .setUv2(blockLight, skyLight)
                   .setNormal(nx, ny, nz);
             }
         }
