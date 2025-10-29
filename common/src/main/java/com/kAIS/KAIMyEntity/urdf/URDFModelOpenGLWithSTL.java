@@ -24,13 +24,10 @@ import java.util.Map;
 /**
  * URDF 모델 렌더링 (STL 메시 포함)
  *
- * - 루트에서만 ROS(Z-up, +X forward) → Minecraft(Y-up, ±Z forward) 보정
- *   * rotateX(-90°) 로 "눕는 현상" 해결
- *   * rotateY(±90°) 로 전진축 정렬
- *   * (옵션) rotateZ(180°) 로 거꾸로 나올 때 뒤집기
- *
- * - 링크/조인트 원점과 축은 "원본 좌표계 그대로" 사용 (추가 보정 없음)
- * - setJointPreview(...) 즉시 반영 + tickUpdate(...)에서 컨트롤러 추종
+ * - 루트에서만 업라이트 보정(ROS/STL 좌표 → Minecraft) 1회 적용
+ *   · Up을 먼저 정확히 맞추고 → Up에 수직인 평면에서 Forward만 정렬 (롤 꼬임 방지)
+ * - 링크/조인트 원점/축은 원본 좌표 기준 (추가 보정 없음)
+ * - setJointPreview(...) 즉시 반영 + tickUpdate(...) 컨트롤러 추종
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -48,24 +45,21 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     // 법선 반전(필요 시)
     private static final boolean FLIP_NORMALS = true;
 
-    // === 방향/보정 스위치 ===
-    /** 마인크래프트 정면을 -Z 로 둘지(+Z 로 반전할지) */
-    private static final boolean FORWARD_NEG_Z = true;   // 기본: -Z 정면
-    /** 모델이 거꾸로 나오면 true로: Z축으로 180° 추가 롤 */
-    private static final boolean ROLL_180_Z = false;
+    // ------------ 업라이트 보정 설정 ------------
+    /** URDF/STL 소스 좌표계 가정 (필요하면 아래 둘만 바꿔서 테스트) */
+    private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1); // 보통 Z-up
+    private static final Vector3f SRC_FWD = new Vector3f(1, 0, 0); // 보통 +X forward
 
-    // 각도 상수
-    private static final float HALF_PI = (float)(Math.PI / 2.0);
-    private static final float PI      = (float)(Math.PI);
+    /** Minecraft 타깃 좌표계 (Up=+Y, Forward=±Z) */
+    private static final boolean FORWARD_NEG_Z = true;             // 정면을 -Z(기본) / +Z
+    private static final Vector3f DST_UP  = new Vector3f(0, 1, 0);
+    private static final Vector3f DST_FWD = FORWARD_NEG_Z ? new Vector3f(0, 0, -1)
+                                                          : new Vector3f(0, 0,  1);
 
-    /** 루트에서 1회만 적용하는 ROS→MC 업라이트 보정 */
-    private static final Quaternionf Q_ROS2MC =
-        new Quaternionf()
-            .rotateX(-HALF_PI)                                   // Z-up → Y-up (눕는 문제 해결 핵심)
-            .rotateY(FORWARD_NEG_Z ? +HALF_PI : -HALF_PI)        // +X → -Z(기본) / +Z(반대)
-            .rotateZ(ROLL_180_Z ? PI : 0f);                      // (옵션) 뒤집힘 보정
+    /** 루트에서 1회만 적용하는 업라이트 보정 */
+    private static final Quaternionf Q_ROS2MC = makeUprightQuat(SRC_UP, SRC_FWD, DST_UP, DST_FWD);
 
-    // ====== 모션/컨트롤 ======
+    // ------------ 모션/컨트롤 ------------
     private final URDFSimpleController ctrl;
     private final URDFMotionEditor motionEditor;
     private final URDFMotionPlayer motionPlayer = new URDFMotionPlayer();
@@ -86,24 +80,23 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         int loadedCount = 0;
         for (URDFLink link : robotModel.links) {
             if (link.visual != null && link.visual.geometry != null) {
-                URDFLink.Geometry geom = link.visual.geometry;
-                if (geom.type == URDFLink.Geometry.GeometryType.MESH && geom.meshFilename != null) {
-                    File meshFile = new File(geom.meshFilename);
-                    if (meshFile.exists()) {
-                        STLLoader.STLMesh mesh = STLLoader.load(geom.meshFilename);
+                URDFLink.Geometry g = link.visual.geometry;
+                if (g.type == URDFLink.Geometry.GeometryType.MESH && g.meshFilename != null) {
+                    File f = new File(g.meshFilename);
+                    if (f.exists()) {
+                        STLLoader.STLMesh mesh = STLLoader.load(g.meshFilename);
                         if (mesh != null) {
-                            if (geom.scale != null &&
-                                (geom.scale.x != 1f || geom.scale.y != 1f || geom.scale.z != 1f)) {
-                                STLLoader.scaleMesh(mesh, geom.scale);
+                            if (g.scale != null && (g.scale.x != 1f || g.scale.y != 1f || g.scale.z != 1f)) {
+                                STLLoader.scaleMesh(mesh, g.scale);
                             }
                             meshCache.put(link.name, mesh);
                             loadedCount++;
                             logger.info("  ✓ Loaded mesh for '{}': {} tris", link.name, mesh.getTriangleCount());
                         } else {
-                            logger.error("  ✗ Failed to load mesh: {}", geom.meshFilename);
+                            logger.error("  ✗ Failed to load mesh: {}", g.meshFilename);
                         }
                     } else {
-                        logger.warn("  ✗ Mesh file not found: {}", geom.meshFilename);
+                        logger.warn("  ✗ Mesh file not found: {}", g.meshFilename);
                     }
                 }
             }
@@ -337,5 +330,68 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
             if (name.equals(j.name)) return j;
         }
         return null;
+    }
+
+    // ============================================
+    // 업라이트 보정 유틸 (안전 버전)
+    // ============================================
+
+    /** Up을 먼저 맞추고 → Up에 수직인 평면에서 Forward만 정렬 (롤 꼬임 방지) */
+    private static Quaternionf makeUprightQuat(Vector3f srcUp, Vector3f srcFwd,
+                                               Vector3f dstUp, Vector3f dstFwd) {
+        Vector3f su = new Vector3f(srcUp).normalize();
+        Vector3f sf = new Vector3f(srcFwd).normalize();
+        Vector3f du = new Vector3f(dstUp).normalize();
+        Vector3f df = new Vector3f(dstFwd).normalize();
+
+        // 1) Up 정렬
+        Quaternionf qUp = fromToQuat(su, du);
+        Vector3f sf1 = sf.rotate(new Quaternionf(qUp));      // Up 정렬 후 forward
+
+        // 2) Up에 수직인 평면에서 Forward 정렬
+        Vector3f sf1p = new Vector3f(sf1).sub(new Vector3f(du).mul(sf1.dot(du)));
+        Vector3f dfp  = new Vector3f(df ).sub(new Vector3f(du).mul(df .dot(du)));
+        if (sf1p.lengthSquared() < 1e-10f || dfp.lengthSquared() < 1e-10f) {
+            return qUp.normalize(); // forward 정보가 퇴화 → Up만 맞춤
+        }
+        sf1p.normalize();
+        dfp.normalize();
+
+        float cos = clamp(sf1p.dot(dfp), -1f, 1f);
+        float angle = (float)Math.acos(cos);
+        Vector3f cross = sf1p.cross(dfp, new Vector3f());
+        if (cross.dot(du) < 0) angle = -angle;
+
+        Quaternionf qFwd = new Quaternionf().fromAxisAngleRad(du, angle);
+
+        return qFwd.mul(qUp).normalize();
+    }
+
+    private static Quaternionf fromToQuat(Vector3f a, Vector3f b) {
+        Vector3f v1 = new Vector3f(a).normalize();
+        Vector3f v2 = new Vector3f(b).normalize();
+        float dot = clamp(v1.dot(v2), -1f, 1f);
+
+        if (dot > 1.0f - 1e-6f) {
+            return new Quaternionf(); // 동일
+        }
+        if (dot < -1.0f + 1e-6f) {
+            // 정반대: 임의의 수직축으로 180°
+            Vector3f axis = pickAnyPerp(v1).normalize();
+            return new Quaternionf().fromAxisAngleRad(axis, (float)Math.PI);
+        }
+        Vector3f axis = v1.cross(v2, new Vector3f()).normalize();
+        float angle = (float)Math.acos(dot);
+        return new Quaternionf().fromAxisAngleRad(axis, angle);
+    }
+
+    private static Vector3f pickAnyPerp(Vector3f v) {
+        Vector3f x = new Vector3f(1,0,0), y = new Vector3f(0,1,0), z = new Vector3f(0,0,1);
+        float dx = Math.abs(v.dot(x)), dy = Math.abs(v.dot(y)), dz = Math.abs(v.dot(z));
+        return (dx < dy && dx < dz) ? x : ((dy < dz) ? y : z);
+    }
+
+    private static float clamp(float v, float lo, float hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
     }
 }
