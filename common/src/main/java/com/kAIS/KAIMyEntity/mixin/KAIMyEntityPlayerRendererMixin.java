@@ -2,6 +2,7 @@ package com.kAIS.KAIMyEntity.mixin;
 
 import com.kAIS.KAIMyEntity.renderer.IMMDModel;
 import com.kAIS.KAIMyEntity.renderer.MMDModelManager;
+import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 
@@ -25,12 +26,29 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.lang.reflect.Field;
+
 @Mixin(PlayerRenderer.class)
 public abstract class KAIMyEntityPlayerRendererMixin
         extends LivingEntityRenderer<AbstractClientPlayer, PlayerModel<AbstractClientPlayer>> {
 
     private static final Logger logger = LogManager.getLogger();
     private static int renderCallCount = 0;
+
+    // ======== 업라이트/방향 스위치 ========
+    /** URDF는 렌더러에서만 보정하므로 믹스인에서는 false (중복 방지) */
+    private static final boolean APPLY_URDF_UPRIGHT_IN_MIXIN = false;
+    /** URDF 전진축: -Z(기본) / +Z(반전) */
+    private static final boolean FORWARD_NEG_Z_URDF = true;
+    /** URDF가 거꾸로 보이면 true로 (Z축 180도) */
+    private static final boolean ROLL_180_Z_URDF = false;
+
+    /** MMD 경로 보정 */
+    private static final boolean FORWARD_NEG_Z = true;
+    private static final boolean ROLL_180_Z = false;
+
+    private static final float HALF_PI = (float)(Math.PI / 2.0);
+    private static final float PI      = (float)(Math.PI);
 
     public KAIMyEntityPlayerRendererMixin(EntityRendererProvider.Context ctx,
                                           PlayerModel<AbstractClientPlayer> model,
@@ -42,114 +60,122 @@ public abstract class KAIMyEntityPlayerRendererMixin
     public void render(AbstractClientPlayer player, float entityYaw, float tickDelta,
                        PoseStack pose, MultiBufferSource buffers, int packedLight, CallbackInfo ci) {
 
-        // 모델 조회 (플레이어 이름별 우선, 없으면 기본 모델)
+        // 1) 모델 획득
+        URDFModelOpenGLWithSTL urdfFromTickLoop = tryGetClientTickLoopRenderer();
+        URDFModelOpenGLWithSTL urdfFromManager = null;
+        IMMDModel generic = null;
+
         String playerName = player.getName().getString();
         MMDModelManager.Model m = MMDModelManager.GetModel("EntityPlayer_" + playerName);
-        if (m == null) {
-            m = MMDModelManager.GetModel("EntityPlayer");
-        }
-        
-        // URDF 모델이 없으면 바닐라 렌더링 진행
-        if (m == null || m.model == null) {
-            return;
+        if (m == null) m = MMDModelManager.GetModel("EntityPlayer");
+        if (m != null) {
+            generic = m.model;
+            if (generic instanceof URDFModelOpenGLWithSTL) {
+                urdfFromManager = (URDFModelOpenGLWithSTL) generic;
+            }
         }
 
-        // 디버그 로깅 (20틱마다)
+        URDFModelOpenGLWithSTL urdf = (urdfFromTickLoop != null) ? urdfFromTickLoop : urdfFromManager;
+
+        if (urdf == null && generic == null) return;
+
+        // 2) 로그
         renderCallCount++;
-        if (renderCallCount % 20 == 0) {
-            logger.debug("Rendering URDF model for player: " + playerName);
+        if (renderCallCount % 60 == 0) {
+            if (urdf != null) {
+                logger.debug("[URDF] using instance#{} (source: {}) uprightInMixin={}",
+                        System.identityHashCode(urdf),
+                        (urdf == urdfFromTickLoop) ? "ClientTickLoop" : "Manager",
+                        APPLY_URDF_UPRIGHT_IN_MIXIN);
+            } else {
+                logger.debug("[MMD] render generic model");
+            }
         }
 
-        IMMDModel model = m.model;
-
-        // URDF는 텍스처 없음 - 흰색 텍스처 사용 (버텍스 컬러로 색상 표현)
+        // 3) 텍스처
         ResourceLocation whiteTexture = ResourceLocation.parse("minecraft:textures/misc/white.png");
-        
-        // RenderType 선택 - Solid로 변경 (URDF는 불투명)
-        RenderType renderType = RenderType.entitySolid(whiteTexture);
+        ResourceLocation tex = (generic != null ? generic.getTexture() : null);
+        RenderType renderType = (tex != null)
+                ? RenderType.entitySolid(tex)
+                : RenderType.entitySolid(whiteTexture);
         VertexConsumer vertexConsumer = buffers.getBuffer(renderType);
 
         pose.pushPose();
-        
-        // ===== 플레이어 위치 조정 =====
-        // Minecraft 플레이어 기준점은 발이므로 모델을 위로 올려줌
-        pose.translate(0, 1.5f, 0);  // 플레이어 높이에 맞게 조정
-        
-        // ===== ROS (Z-up) → Minecraft (Y-up) 좌표계 변환 =====
-        // X축 기준 -90도 회전하여 Z-up을 Y-up으로 변환
-        pose.mulPose(new Quaternionf().rotateX((float)(-Math.PI / 2)));
-        
-        // ===== 추가 스케일 조정 (필요시) =====
-        // URDF 모델이 너무 크거나 작으면 여기서 조정
-        float modelScale = 1.0f;  // 필요시 조정
-        if (m.properties != null && m.properties.containsKey("modelScale")) {
+
+        // 위치 보정
+        pose.translate(0.0f, 0.0f, 0.0f);
+
+        // 좌표계 보정
+        if (urdf == null) {
+            Quaternionf q = new Quaternionf()
+                    .rotateX(-HALF_PI)
+                    .rotateY(FORWARD_NEG_Z ? +HALF_PI : -HALF_PI);
+            if (ROLL_180_Z) q.rotateZ(PI);
+            pose.mulPose(q);
+        } else if (APPLY_URDF_UPRIGHT_IN_MIXIN) {
+            Quaternionf q = new Quaternionf()
+                    .rotateX(-HALF_PI)
+                    .rotateY(FORWARD_NEG_Z_URDF ? +HALF_PI : -HALF_PI);
+            if (ROLL_180_Z_URDF) q.rotateZ(PI);
+            pose.mulPose(q);
+        }
+
+        // 스케일 (MMD만 적용)
+        if (urdf == null && m != null && m.properties != null && m.properties.containsKey("modelScale")) {
             try {
-                modelScale = Float.parseFloat(m.properties.getProperty("modelScale"));
-            } catch (NumberFormatException e) {
-                // 기본값 사용
-            }
+                float modelScale = Float.parseFloat(m.properties.getProperty("modelScale"));
+                pose.scale(modelScale, modelScale, modelScale);
+            } catch (NumberFormatException ignored) { }
         }
-        pose.scale(modelScale, modelScale, modelScale);
-        
-        // ===== 플레이어 회전 적용 =====
-        // 플레이어가 바라보는 방향으로 모델 회전
-        pose.mulPose(new Quaternionf().rotateY((float)Math.toRadians(-entityYaw)));
-        
-        // ===== 애니메이션 오프셋 (선택사항) =====
-        // 걷기, 달리기 등의 애니메이션에 따른 미세 조정
-        float walkAnimOffset = 0.0f;
-        if (player.walkAnimation.speed() > 0.1f) {
-            walkAnimOffset = (float)Math.sin(player.walkAnimation.position() * 0.6662F) * 0.1f;
-        }
-        pose.translate(0, walkAnimOffset, 0);
-        
-        // ===== 조명 개선 =====
-        // URDF 모델이 너무 어둡게 보이지 않도록 최소 밝기 보장
+
+        // 조명
         int blockLight = (packedLight & 0xFFFF);
-        int skyLight = (packedLight >> 16) & 0xFFFF;
-        
-        // 최소 밝기 설정 (0xF0 = 거의 최대 밝기)
-        blockLight = Math.max(blockLight, 0xA0);  // 블록 조명 최소값
-        skyLight = Math.max(skyLight, 0xA0);      // 하늘 조명 최소값
+        int skyLight   = (packedLight >> 16) & 0xFFFF;
+        blockLight = Math.max(blockLight, 0xF0);
+        skyLight  = Math.max(skyLight,  0xF0);
         int adjustedLight = (skyLight << 16) | blockLight;
-        
-        // ===== 모델 렌더링 호출 =====
-        // IMMDModel 인터페이스의 renderToBuffer 메서드 호출
-        if (model.getTexture() != null) {
-            // 텍스처가 있는 경우 (향후 확장용)
-            ResourceLocation modelTexture = model.getTexture();
-            renderType = RenderType.entitySolid(modelTexture);
-            vertexConsumer = buffers.getBuffer(renderType);
+
+        // 4) 실제 렌더링
+        if (urdf != null) {
+            urdf.tickUpdate(1.0f / 20.0f);
+            urdf.Render(
+                player,
+                entityYaw,
+                player.getXRot(),
+                new Vector3f(0f, 0f, 0f),
+                tickDelta,
+                pose,
+                adjustedLight
+            );
+        } else {
+            generic.renderToBuffer(
+                player,
+                entityYaw,
+                player.getXRot(),
+                new Vector3f(0f, 0f, 0f),
+                tickDelta,
+                pose,
+                vertexConsumer,
+                adjustedLight,
+                OverlayTexture.NO_OVERLAY
+            );
         }
-        
-        // 실제 렌더링 수행
-        model.renderToBuffer(
-            player,           // 엔티티
-            entityYaw,        // Yaw 회전
-            0f,               // Pitch (URDF는 보통 pitch 사용 안 함)
-            new Vector3f(0f, 0f, 0f),  // 추가 변환 (없음)
-            tickDelta,        // 틱 델타
-            pose,             // PoseStack
-            vertexConsumer,   // VertexConsumer
-            adjustedLight,    // 조명 (수정된 값)
-            OverlayTexture.NO_OVERLAY  // 오버레이 (대미지 효과 등)
-        );
-        
+
         pose.popPose();
-        
-        // ===== 추가 렌더링 요소 (선택사항) =====
-        // 플레이어 이름표, 그림자 등은 바닐라 렌더러에서 처리되도록
-        // 필요하면 여기서 super.render() 일부 호출 가능
-        
-        // 디버그 정보 (개발 중일 때만)
-        if (renderCallCount % 100 == 0) {
-            logger.info("URDF Model rendered successfully for: " + playerName);
-            logger.info("  - Model directory: " + model.GetModelDir());
-            logger.info("  - Adjusted lighting: block=" + Integer.toHexString(blockLight) + 
-                       ", sky=" + Integer.toHexString(skyLight));
-        }
-        
-        // 바닐라 플레이어 렌더링 취소 (우리가 직접 렌더했으므로)
+
         ci.cancel();
+    }
+
+    /** 런타임에 ClientTickLoop.renderer 조회 */
+    private static URDFModelOpenGLWithSTL tryGetClientTickLoopRenderer() {
+        try {
+            Class<?> cls = Class.forName("com.kAIS.KAIMyEntity.neoforge.ClientTickLoop");
+            Field f = cls.getField("renderer");
+            Object o = f.get(null);
+            if (o instanceof URDFModelOpenGLWithSTL) {
+                return (URDFModelOpenGLWithSTL) o;
+            }
+        } catch (Throwable ignored) { }
+        return null;
     }
 }
