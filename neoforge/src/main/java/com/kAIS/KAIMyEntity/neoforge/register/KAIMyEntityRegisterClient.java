@@ -67,6 +67,11 @@ public class KAIMyEntityRegisterClient {
         logger.info("KAIMyEntityRegisterClient: key mappings registered.");
     }
 
+    // === 하위호환용 Register() (초기화 호출 호환) ===
+    public static void Register() {
+        logger.info("KAIMyEntityRegisterClient.Register() called (no-op, use event-based registration).");
+    }
+
     @OnlyIn(Dist.CLIENT)
     @SubscribeEvent
     public static void onKeyPressed(InputEvent.Key event) {
