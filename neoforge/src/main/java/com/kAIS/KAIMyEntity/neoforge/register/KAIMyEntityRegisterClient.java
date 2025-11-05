@@ -7,6 +7,7 @@ import com.kAIS.KAIMyEntity.renderer.MMDModelManager;
 import com.kAIS.KAIMyEntity.neoforge.ClientTickLoop;
 import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import com.kAIS.KAIMyEntity.urdf.control.MotionEditorScreen;
+import com.kAIS.KAIMyEntity.urdf.control.URDFMotionEditor;
 
 import com.mojang.blaze3d.platform.InputConstants;
 import net.minecraft.client.Minecraft;
@@ -30,32 +31,30 @@ import org.apache.logging.log4j.Logger;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.Objects;
 
 /**
  * 클라이언트 키 등록 & 처리
  * - V/B/N/M: 기존 커스텀 애니메이션 (유지)
- * - G: 모션 에디터 GUI 열기 (없으면 자동 로드 시도)
+ * - G: 조인트 에디터 열기 (없으면 자동 로드 시도)
  * - Ctrl+G: URDF 리로드 + 자동 로드 시도
  * - H: 물리 리셋
- *
- * ⚠️ 별도의 /urdf load 커맨드 파일 없이, 여기서 자동 로드/주입까지 처리함.
+ * - K: VMC 매핑 에디터 열기
  */
 @EventBusSubscriber(value = Dist.CLIENT)
 public class KAIMyEntityRegisterClient {
     static final Logger logger = LogManager.getLogger();
 
-    // === 기존 키 + 동작 통합 ===
+    // === 키맵 ===
     static KeyMapping keyCustomAnim1 = new KeyMapping("key.customAnim1", KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_V, "key.title");
     static KeyMapping keyCustomAnim2 = new KeyMapping("key.customAnim2", KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_B, "key.title");
     static KeyMapping keyCustomAnim3 = new KeyMapping("key.customAnim3", KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_N, "key.title");
     static KeyMapping keyCustomAnim4 = new KeyMapping("key.customAnim4", KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_M, "key.title");
     static KeyMapping keyMotionGuiOrReload = new KeyMapping("key.motionGuiOrReload", KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_G, "key.title");
-    static KeyMapping keyResetPhysics     = new KeyMapping("key.resetPhysics",     KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_H, "key.title");
+    static KeyMapping keyOpenVmcMapping    = new KeyMapping("key.openVmcMapping",  KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_K, "key.title");
+    static KeyMapping keyResetPhysics      = new KeyMapping("key.resetPhysics",    KeyConflictContext.IN_GAME, KeyModifier.NONE, InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_H, "key.title");
 
-    // 정석: 이벤트로 키 등록
+    // === 키 등록 ===
     @SubscribeEvent
     public static void onRegisterKeyMappings(RegisterKeyMappingsEvent e) {
         e.register(keyCustomAnim1);
@@ -63,13 +62,9 @@ public class KAIMyEntityRegisterClient {
         e.register(keyCustomAnim3);
         e.register(keyCustomAnim4);
         e.register(keyMotionGuiOrReload);
+        e.register(keyOpenVmcMapping);
         e.register(keyResetPhysics);
         logger.info("KAIMyEntityRegisterClient: key mappings registered.");
-    }
-
-    // 구 Register()는 더 이상 필요 없지만, 외부에서 호출해도 부작용 없도록 no-op
-    public static void Register() {
-        logger.info("KAIMyEntityRegisterClient.Register() called (no-op). Use event-based registration instead.");
     }
 
     @OnlyIn(Dist.CLIENT)
@@ -79,65 +74,42 @@ public class KAIMyEntityRegisterClient {
         LocalPlayer player = MC.player;
         if (player == null) return;
 
-        // ==== 기존 커스텀 애니메이션 유지 ====
-        if (keyCustomAnim1.isDown()) {
-            var m = MMDModelManager.GetModel("EntityPlayer_" + player.getName().getString());
-            if (m != null) {
-                KAIMyEntityRendererPlayerHelper.CustomAnim(player, "1");
-                net.neoforged.neoforge.network.PacketDistributor.sendToServer(
-                        new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(1, player.getGameProfile(), 1));
-            }
-        }
-        if (keyCustomAnim2.isDown()) {
-            var m = MMDModelManager.GetModel("EntityPlayer_" + player.getName().getString());
-            if (m != null) {
-                KAIMyEntityRendererPlayerHelper.CustomAnim(player, "2");
-                net.neoforged.neoforge.network.PacketDistributor.sendToServer(
-                        new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(1, player.getGameProfile(), 2));
-            }
-        }
-        if (keyCustomAnim3.isDown()) {
-            var m = MMDModelManager.GetModel("EntityPlayer_" + player.getName().getString());
-            if (m != null) {
-                KAIMyEntityRendererPlayerHelper.CustomAnim(player, "3");
-                net.neoforged.neoforge.network.PacketDistributor.sendToServer(
-                        new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(1, player.getGameProfile(), 3));
-            }
-        }
-        if (keyCustomAnim4.isDown()) {
-            var m = MMDModelManager.GetModel("EntityPlayer_" + player.getName().getString());
-            if (m != null) {
-                KAIMyEntityRendererPlayerHelper.CustomAnim(player, "4");
-                net.neoforged.neoforge.network.PacketDistributor.sendToServer(
-                        new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(1, player.getGameProfile(), 4));
-            }
-        }
+        // ==== 커스텀 애니메이션 유지 ====
+        handleCustomAnim(player);
 
-        // ==== G: 모션 GUI / Ctrl+G: 리로드 (+ 자동 로드 시도) ====
-        if (keyMotionGuiOrReload.consumeClick()) { // 한 번만 처리
+        // ==== G: 조인트 에디터 / Ctrl+G: 리로드 ====
+        if (keyMotionGuiOrReload.consumeClick()) {
             long win = MC.getWindow().getWindow();
             boolean ctrl = org.lwjgl.glfw.GLFW.glfwGetKey(win, GLFW.GLFW_KEY_LEFT_CONTROL)  == GLFW.GLFW_PRESS
                         || org.lwjgl.glfw.GLFW.glfwGetKey(win, GLFW.GLFW_KEY_RIGHT_CONTROL) == GLFW.GLFW_PRESS;
 
             if (ctrl) {
-                // Ctrl+G → 기존 리로드 + 렌더러 자동 세팅 시도
+                // Ctrl+G → 리로드
                 try {
                     MMDModelManager.ReloadModel();
                     MC.gui.getChat().addMessage(Component.literal("[URDF] models reloaded"));
                 } catch (Throwable t) {
                     MC.gui.getChat().addMessage(Component.literal("[URDF] reload failed: " + t.getMessage()));
                 }
-                ensureActiveRenderer(MC); // 🔹 리로드 후 렌더러 없으면 자동 세팅 시도
+                ensureActiveRenderer(MC);
             } else {
-                // G → GUI 열기 (없으면 자동 세팅 시도)
-                if (ClientTickLoop.renderer == null) {
-                    ensureActiveRenderer(MC);
-                }
+                // G → 조인트 에디터 열기
+                if (ClientTickLoop.renderer == null) ensureActiveRenderer(MC);
                 if (ClientTickLoop.renderer != null) {
                     MC.setScreen(new MotionEditorScreen(ClientTickLoop.renderer));
                 } else {
                     MC.gui.getChat().addMessage(Component.literal("[URDF] No active renderer. Put a *.urdf under ./KAIMyEntity or ./config and press G again."));
                 }
+            }
+        }
+
+        // ==== K: VMC 매핑 에디터 열기 ====
+        if (keyOpenVmcMapping.consumeClick()) {
+            if (ClientTickLoop.renderer == null) ensureActiveRenderer(MC);
+            if (ClientTickLoop.renderer != null) {
+                MC.setScreen(new URDFMotionEditor(MC.screen, ClientTickLoop.renderer));
+            } else {
+                MC.gui.getChat().addMessage(Component.literal("[URDF] No active renderer. Put a *.urdf under ./KAIMyEntity or ./config and press K again."));
             }
         }
 
@@ -153,39 +125,36 @@ public class KAIMyEntityRegisterClient {
         }
     }
 
-    // =========================================================
-    // 헬퍼: 렌더러 자동 세팅 (/urdf load 없이도 동작)
-    // - ./KAIMyEntity, ./config/kaimyentity, ./config 에서 첫 번째 *.urdf 검색
-    // - modelDir 는 urdf 파일이 있는 폴더 또는 ./meshes 하위 폴더 우선
-    // =========================================================
+    // === 커스텀 애니메이션 처리 ===
+    private static void handleCustomAnim(LocalPlayer player) {
+        var m = MMDModelManager.GetModel("EntityPlayer_" + player.getName().getString());
+        if (m == null) return;
+        if (keyCustomAnim1.isDown()) sendAnim(player, 1);
+        if (keyCustomAnim2.isDown()) sendAnim(player, 2);
+        if (keyCustomAnim3.isDown()) sendAnim(player, 3);
+        if (keyCustomAnim4.isDown()) sendAnim(player, 4);
+    }
+
+    private static void sendAnim(LocalPlayer player, int index) {
+        KAIMyEntityRendererPlayerHelper.CustomAnim(player, String.valueOf(index));
+        net.neoforged.neoforge.network.PacketDistributor.sendToServer(
+                new com.kAIS.KAIMyEntity.neoforge.network.KAIMyEntityNetworkPack(1, player.getGameProfile(), index));
+    }
+
+    // === 렌더러 자동 로드 ===
     private static void ensureActiveRenderer(Minecraft mc) {
         if (ClientTickLoop.renderer != null) return;
         File gameDir = mc.gameDirectory;
-
-        File[] candidates = new File[] {
-                new File(gameDir, "KAIMyEntity"),
-                new File(gameDir, "config/kaimyentity"),
-                new File(gameDir, "config"),
-                gameDir
-        };
-
-        File urdf = null;
-        for (File root : candidates) {
-            urdf = findFirstUrdf(root, 2); // 깊이 2까지 탐색
-            if (urdf != null) break;
-        }
-
+        File urdf = findFirstUrdf(gameDir, 2);
         if (urdf == null) {
             mc.gui.getChat().addMessage(Component.literal("[URDF] No *.urdf found under ./KAIMyEntity or ./config"));
             return;
         }
-
         File modelDir = guessModelDir(urdf);
         if (modelDir == null || !modelDir.isDirectory()) {
             mc.gui.getChat().addMessage(Component.literal("[URDF] Guessing modelDir failed: " + (modelDir == null ? "null" : modelDir)));
             return;
         }
-
         URDFModelOpenGLWithSTL r = URDFModelOpenGLWithSTL.Create(urdf.getAbsolutePath(), modelDir.getAbsolutePath());
         if (r == null) {
             mc.gui.getChat().addMessage(Component.literal("[URDF] Parse failed: " + urdf.getAbsolutePath()));
@@ -212,7 +181,6 @@ public class KAIMyEntityRegisterClient {
     }
 
     private static File guessModelDir(File urdfFile) {
-        // 우선순위: <urdf폴더>/meshes → <urdf폴더>
         File parent = urdfFile.getParentFile();
         if (parent == null) return null;
         File meshes = new File(parent, "meshes");
