@@ -2,11 +2,13 @@ package com.kAIS.KAIMyEntity.urdf.control;
 
 import com.kAIS.KAIMyEntity.urdf.URDFJoint;
 import com.kAIS.KAIMyEntity.urdf.URDFRobotModel;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
@@ -15,51 +17,78 @@ import java.lang.reflect.Method;
 import java.util.*;
 
 /**
- * URDFMotionEditor (이름 유지) — MotionEditorScreen 스타일 인스펙터
- * - 매핑 기능 제거
- * - 좌: VMC HumanoidTag(본) 리스트 (수동 렌더, 페이지네이션)
- * - 우: URDF 조인트(모터) 리스트 (수동 렌더, 페이지네이션)
- * - ESC로 닫기, F5로 새로고침
+ * URDFMotionEditor (이름 유지) — 간단 인스펙터/자료 페이지
  *
- * 시각 수정:
- * - 전체 배경/패널을 불투명 색으로 그림 (투명감 제거)
+ * - VMC가 없어도 좌측에 "표준 VRM 본"을 항상 표시 (자료용)
+ * - VMC가 연결되면 자동으로 실제 본 상태로 교체 표시
+ * - 우측에는 URDF 조인트(모터) 목록/현재값/제한을 표시
+ * - F5 새로고침, 1초 간격 자동 새로고침
+ *
+ * ※ 외부 의존성: 전부 리플렉션으로 접근 (컴파일 타임 의존성 없음)
  */
 public class URDFMotionEditor extends Screen {
 
-    // ---------- 색상(불투명) ----------
-    private static final int BG_COLOR    = 0xFF0E0E10; // 화면 전체 배경
+    // -------- 시각/색상(불투명) --------
+    private static final int BG_COLOR    = 0xFF0E0E10; // 전체 배경
     private static final int PANEL_COLOR = 0xFF1D1F24; // 좌/우 패널 박스
-    private static final int TITLE_LEFT_COLOR  = 0xFFFFD770;
-    private static final int TITLE_RIGHT_COLOR = 0xFFFFD770;
-    private static final int TEXT_LEFT_COLOR   = 0xFFFFFFFF;
-    private static final int TEXT_LEFT_SUB     = 0xFFA0E0FF;
-    private static final int TEXT_RIGHT_COLOR  = 0xFFFFFFFF;
-    private static final int TEXT_RIGHT_SUB    = 0xFFB0FFA0;
+    private static final int TITLE_COLOR = 0xFFFFD770;
+    private static final int TXT_MAIN    = 0xFFFFFFFF;
+    private static final int TXT_SUB_L   = 0xFFA0E0FF;
+    private static final int TXT_SUB_R   = 0xFFB0FFA0;
 
+    // -------- 기본 VRM 본 목록(소문자 camelCase) --------
+    private static final String[] DEFAULT_VRM_BONES = {
+            // 몸통
+            "hips","spine","chest","upperChest","neck","head",
+            // 왼팔
+            "leftShoulder","leftUpperArm","leftLowerArm","leftHand",
+            // 오른팔
+            "rightShoulder","rightUpperArm","rightLowerArm","rightHand",
+            // 왼다리
+            "leftUpperLeg","leftLowerLeg","leftFoot","leftToes",
+            // 오른다리
+            "rightUpperLeg","rightLowerLeg","rightFoot","rightToes",
+            // 손가락(생략 가능) - 필요시 아래 주석 해제
+            //"leftThumbProximal","leftThumbIntermediate","leftThumbDistal",
+            //"leftIndexProximal","leftIndexIntermediate","leftIndexDistal",
+            //"leftMiddleProximal","leftMiddleIntermediate","leftMiddleDistal",
+            //"leftRingProximal","leftRingIntermediate","leftRingDistal",
+            //"leftLittleProximal","leftLittleIntermediate","leftLittleDistal",
+            //"rightThumbProximal","rightThumbIntermediate","rightThumbDistal",
+            //"rightIndexProximal","rightIndexIntermediate","rightIndexDistal",
+            //"rightMiddleProximal","rightMiddleIntermediate","rightMiddleDistal",
+            //"rightRingProximal","rightRingIntermediate","rightRingDistal",
+            //"rightLittleProximal","rightLittleIntermediate","rightLittleDistal"
+    };
+
+    // -------- 상태/데이터 --------
     private final Screen parent;
     private final Object renderer; // getRobotModel()
 
-    // 좌/우 리스트 데이터
-    private final List<BoneRow> boneRows = new ArrayList<>();
-    private final List<JointRow> jointRows = new ArrayList<>();
+    private final List<Row> boneRows  = new ArrayList<>();
+    private final List<Row> jointRows = new ArrayList<>();
 
-    // 페이지 상태
+    // 페이지네이션
+    private int perPageLeft  = 18;
+    private int perPageRight = 18;
     private int bonePage = 0;
     private int jointPage = 0;
-    private int perPageLeft = 18;
-    private int perPageRight = 18;
 
-    // 레이아웃 캐시
-    private int margin = 8;
-    private int titleH = 16;
+    // 레이아웃
+    private final int margin = 8;
+    private final int titleH = 16;
     private int listTop;
+    private int listHeight;
     private int colWidth;
     private int leftX, rightX;
-    private int listHeight;
 
-    // UI 버튼 (상단 컨트롤만 사용)
+    // 버튼
     private Button bonePrevBtn, boneNextBtn, bonePageBtn;
     private Button jointPrevBtn, jointNextBtn, jointPageBtn;
+    private Button refreshBtn;
+
+    // 자동 새로고침
+    private int autoRefreshTicker = 0;
 
     public URDFMotionEditor(Screen parent, Object renderer) {
         super(Component.literal("VMC & URDF Inspector"));
@@ -67,40 +96,59 @@ public class URDFMotionEditor extends Screen {
         this.renderer = renderer;
     }
 
-    // 하위호환: 예전 호출(new URDFMotionEditor(robotModel, ctrl))
+    /** 하위호환: 예전 호출 (new URDFMotionEditor(robotModel, ctrl))용 어댑터 */
     public URDFMotionEditor(URDFRobotModel model, URDFSimpleController ctrl) {
         this(Minecraft.getInstance() != null ? Minecraft.getInstance().screen : null,
-             new LegacyRendererAdapter(model));
+             new LegacyRendererAdapter(model, ctrl));
     }
     private static final class LegacyRendererAdapter {
         private final URDFRobotModel model;
-        LegacyRendererAdapter(URDFRobotModel model) { this.model = model; }
+        private final URDFSimpleController ctrl;
+        LegacyRendererAdapter(URDFRobotModel model, URDFSimpleController ctrl) {
+            this.model = model; this.ctrl = ctrl;
+        }
         public URDFRobotModel getRobotModel() { return model; }
+        public void setJointPreview(String name, float value) {
+            if (model == null || model.joints == null) return;
+            for (URDFJoint j : model.joints) {
+                if (j != null && name.equals(j.name)) {
+                    j.currentPosition = value;
+                    if (ctrl != null) {
+                        try {
+                            ctrl.getClass().getMethod("setJointPosition", String.class, float.class)
+                                .invoke(ctrl, name, value);
+                        } catch (Throwable ignored) {}
+                    }
+                    break;
+                }
+            }
+        }
+        public String GetModelDir() { return "."; }
     }
 
     @Override
     protected void init() {
         super.init();
         computeLayout();
-        buildData();
+        buildData(/*force*/true);
         buildHeaderControls();
         updatePageLabels();
     }
 
     private void computeLayout() {
-        listTop = margin + titleH + 4;
-        listHeight = Math.max(120, this.height - listTop - 20); // 최소 높이 확보
+        listTop = margin + titleH + 6;
+        listHeight = Math.max(120, this.height - listTop - 20);
         colWidth = (this.width - margin * 3) / 2;
         leftX = margin;
         rightX = leftX + colWidth + margin;
 
-        // 행 높이 12px 기준 perPage 결정
-        perPageLeft = Math.max(5, listHeight / 12);
+        int rowH = 12;
+        perPageLeft = Math.max(6, listHeight / rowH);
         perPageRight = perPageLeft;
     }
 
     private void buildHeaderControls() {
-        // 좌측 헤더 Prev/Next
+        // 좌측
         bonePrevBtn = addRenderableWidget(Button.builder(Component.literal("< Prev"), b -> {
             if (bonePage > 0) bonePage--;
             updatePageLabels();
@@ -116,7 +164,7 @@ public class URDFMotionEditor extends Screen {
                 .bounds(leftX + 132, listTop - 26, 90, 20).build());
         bonePageBtn.active = false;
 
-        // 우측 헤더 Prev/Next
+        // 우측
         jointPrevBtn = addRenderableWidget(Button.builder(Component.literal("< Prev"), b -> {
             if (jointPage > 0) jointPage--;
             updatePageLabels();
@@ -131,6 +179,12 @@ public class URDFMotionEditor extends Screen {
         jointPageBtn = addRenderableWidget(Button.builder(Component.literal("Page"), b -> {})
                 .bounds(rightX + 132, listTop - 26, 90, 20).build());
         jointPageBtn.active = false;
+
+        // 중앙 상단 새로고침
+        refreshBtn = addRenderableWidget(Button.builder(Component.literal("F5 / Refresh"), b -> {
+            buildData(true);
+            updatePageLabels();
+        }).bounds(this.width/2 - 60, listTop - 26, 120, 20).build());
     }
 
     private void updatePageLabels() {
@@ -143,52 +197,149 @@ public class URDFMotionEditor extends Screen {
         jointPageBtn.setMessage(Component.literal("Page " + (jointPage+1) + "/" + jointPages));
     }
 
-    private void buildData() {
+    /** 데이터 빌드: VMC가 없으면 VRM 기본 리스트를 채움 */
+    private void buildData(boolean force) {
+        // 이미 채워져 있고 강제 아님이면 스킵
+        if (!force && !boneRows.isEmpty() && !jointRows.isEmpty()) return;
+
         boneRows.clear();
         jointRows.clear();
 
-        // VMC 본 덤프
+        // ---- 본 목록 (VMC 있으면 실제값, 없으면 VRM 기본) ----
         Map<String, Object> bones = reflectCollectBoneMap(reflectGetVmcState());
-        List<String> boneNames = new ArrayList<>(bones.keySet());
-        boneNames.sort(String.CASE_INSENSITIVE_ORDER);
-
-        if (boneNames.isEmpty()) {
-            boneRows.add(new BoneRow("(no VMC state)", "-"));
+        if (bones.isEmpty()) {
+            // VMC가 없어도 자료 페이지로 떠야 하므로 VRM 기본 본 표출
+            for (String n : DEFAULT_VRM_BONES) {
+                boneRows.add(new Row(n, "(no VMC)"));
+            }
         } else {
-            for (String name : boneNames) {
+            List<String> names = new ArrayList<>(bones.keySet());
+            names.sort(String.CASE_INSENSITIVE_ORDER);
+            for (String name : names) {
                 Object tr = bones.get(name);
                 float[] p = extractPos(tr);
                 float[] e = extractEuler(tr);
-                String line = String.format(Locale.ROOT,
+                String detail = String.format(Locale.ROOT,
                         "X:%.2f Y:%.2f Z:%.2f | p:%.2f y:%.2f r:%.2f",
                         p[0], p[1], p[2], e[0], e[1], e[2]);
-                boneRows.add(new BoneRow(name, line));
+                boneRows.add(new Row(name, detail));
             }
         }
 
-        // URDF 조인트 덤프
+        // ---- 조인트 목록 ----
         URDFRobotModel model = reflectGetRobotModel();
         if (model == null || model.joints == null || model.joints.isEmpty()) {
-            jointRows.add(new JointRow("(no URDF model)", ""));
+            jointRows.add(new Row("(no URDF model)", ""));
         } else {
             for (URDFJoint j : model.joints) {
-                String name = j.name != null ? j.name : "(unnamed)";
-                float curDeg = (float) Math.toDegrees(j.currentPosition);
-                String limTxt;
+                String name = (j != null && j.name != null) ? j.name : "(unnamed)";
+                float curDeg = (float)Math.toDegrees(j.currentPosition);
+                String lim;
                 if (j.limit != null && j.limit.hasLimits() && j.limit.upper > j.limit.lower) {
-                    int lo = Math.round((float) Math.toDegrees(j.limit.lower));
-                    int hi = Math.round((float) Math.toDegrees(j.limit.upper));
-                    limTxt = String.format(Locale.ROOT, "cur:%d° | lim:[%d°, %d°]", Math.round(curDeg), lo, hi);
+                    int lo = Math.round((float)Math.toDegrees(j.limit.lower));
+                    int hi = Math.round((float)Math.toDegrees(j.limit.upper));
+                    lim = String.format(Locale.ROOT, "cur:%d° | lim:[%d°, %d°]", Math.round(curDeg), lo, hi);
                 } else {
-                    limTxt = String.format(Locale.ROOT, "cur:%d° | lim:(none)", Math.round(curDeg));
+                    lim = String.format(Locale.ROOT, "cur:%d° | lim:(none)", Math.round(curDeg));
                 }
-                jointRows.add(new JointRow(name, limTxt));
+                jointRows.add(new Row(name, lim));
             }
         }
 
-        // 페이지 초기화
         bonePage = 0;
         jointPage = 0;
+    }
+
+    // ===== 렌더 =====
+    @Override
+    public void render(GuiGraphics g, int mouseX, int mouseY, float partialTicks) {
+        // 배경/패널
+        g.fill(0, 0, this.width, this.height, BG_COLOR);
+        g.fill(leftX,  listTop, leftX  + colWidth, listTop + listHeight, PANEL_COLOR);
+        g.fill(rightX, listTop, rightX + colWidth, listTop + listHeight, PANEL_COLOR);
+
+        // 기본 위젯
+        super.render(g, mouseX, mouseY, partialTicks);
+
+        // 텍스트는 위로
+        g.pose().pushPose();
+        g.pose().translate(0, 0, 1000.0f);
+
+        // 타이틀
+        g.drawString(this.font, "VMC Bones (Humanoid / VRM) — shows defaults when VMC is off", leftX, 6, TITLE_COLOR, false);
+        g.drawString(this.font, "URDF Joints (Motors)",                                      rightX, 6, TITLE_COLOR, false);
+
+        // 좌측 리스트
+        int y = listTop + 4;
+        int start = bonePage * perPageLeft;
+        int end = Math.min(boneRows.size(), start + perPageLeft);
+        for (int i = start; i < end; i++) {
+            Row r = boneRows.get(i);
+            g.drawString(this.font, r.name, leftX + 4, y, TXT_MAIN, false);
+            int nx = leftX + 4 + this.font.width(r.name) + 6;
+            g.drawString(this.font, r.detail, nx, y, TXT_SUB_L, false);
+            y += 12;
+        }
+
+        // 우측 리스트
+        y = listTop + 4;
+        start = jointPage * perPageRight;
+        end = Math.min(jointRows.size(), start + perPageRight);
+        for (int i = start; i < end; i++) {
+            Row r = jointRows.get(i);
+            g.drawString(this.font, r.name, rightX + 4, y, TXT_MAIN, false);
+            int nx = rightX + 4 + this.font.width(r.name) + 6;
+            g.drawString(this.font, r.detail, nx, y, TXT_SUB_R, false);
+            y += 12;
+        }
+
+        g.pose().popPose();
+
+        // 자동 새로고침 (1초 간격)
+        if (++autoRefreshTicker >= 20) {
+            autoRefreshTicker = 0;
+            Object st = reflectGetVmcState();
+            if (st != null) { // VMC가 붙었으면 실제 데이터로 갱신
+                buildData(true);
+                updatePageLabels();
+            } else if (boneRows.isEmpty()) { // 안전: 비었으면 기본값 채우기
+                buildData(true);
+                updatePageLabels();
+            }
+        }
+    }
+
+    // 스크롤: 패널별 페이지 이동
+    @Override
+    public boolean mouseScrolled(double mx, double my, double deltaX, double deltaY) {
+        double delta = (Math.abs(deltaY) > 0.0) ? deltaY : deltaX;
+        boolean inLeft  = mx >= leftX  && mx < leftX  + colWidth && my >= listTop && my < listTop + listHeight;
+        boolean inRight = mx >= rightX && mx < rightX + colWidth && my >= listTop && my < listTop + listHeight;
+
+        if (inLeft) {
+            int pages = Math.max(1, (int)Math.ceil(boneRows.size() / (double)perPageLeft));
+            bonePage = clamp(bonePage - (int)Math.signum(delta), 0, pages - 1);
+            updatePageLabels();
+            return true;
+        } else if (inRight) {
+            int pages = Math.max(1, (int)Math.ceil(jointRows.size() / (double)perPageRight));
+            jointPage = clamp(jointPage - (int)Math.signum(delta), 0, pages - 1);
+            updatePageLabels();
+            return true;
+        }
+        return super.mouseScrolled(mx, my, deltaX, deltaY);
+    }
+
+    // F5 새로고침
+    @Override
+    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
+        // GLFW.GLFW_KEY_F5 = 294 (매핑에 따라 다를 수 있으니 숫자 사용)
+        if (keyCode == 294) {
+            buildData(true);
+            updatePageLabels();
+            return true;
+        }
+        return super.keyPressed(keyCode, scanCode, modifiers);
     }
 
     @Override
@@ -214,87 +365,9 @@ public class URDFMotionEditor extends Screen {
         jointNextBtn.setY(listTop - 26);
         jointPageBtn.setX(rightX + 132);
         jointPageBtn.setY(listTop - 26);
-    }
-
-    @Override
-public void render(GuiGraphics g, int mouseX, int mouseY, float partialTicks) {
-    // 1) 전체 화면을 불투명 배경으로 칠함 (투명감 제거)
-    g.fill(0, 0, this.width, this.height, BG_COLOR);
-
-    // 2) 좌/우 패널 박스 (불투명)
-    g.fill(leftX,  listTop, leftX  + colWidth, listTop + listHeight, PANEL_COLOR);
-    g.fill(rightX, listTop, rightX + colWidth, listTop + listHeight, PANEL_COLOR);
-
-    // 3) 기본 위젯들(버튼 등) 먼저 렌더
-    super.render(g, mouseX, mouseY, partialTicks);
-
-    // 4) 텍스트는 "맨 위 레이어"로 올려 그리기 (Z 크게 밀기)
-    g.pose().pushPose();
-    g.pose().translate(0, 0, 1000.0f); // 화면 최상층으로
-
-    // 제목
-    g.drawString(this.font, "VMC Bones (HumanoidTag) — F5 refresh", leftX, 6, TITLE_LEFT_COLOR, false);
-    g.drawString(this.font, "URDF Motors (Joints)",               rightX, 6, TITLE_RIGHT_COLOR, false);
-
-    // 좌측 리스트 텍스트
-    int y = listTop + 4;
-    int start = bonePage * perPageLeft;
-    int end = Math.min(boneRows.size(), start + perPageLeft);
-    for (int i = start; i < end; i++) {
-        BoneRow r = boneRows.get(i);
-        g.drawString(this.font, r.name, leftX + 4, y, TEXT_LEFT_COLOR, false);
-        int nx = leftX + 4 + this.font.width(r.name) + 6;
-        g.drawString(this.font, r.detail, nx, y, TEXT_LEFT_SUB, false);
-        y += 12;
-    }
-
-    // 우측 리스트 텍스트
-    y = listTop + 4;
-    start = jointPage * perPageRight;
-    end = Math.min(jointRows.size(), start + perPageRight);
-    for (int i = start; i < end; i++) {
-        JointRow r = jointRows.get(i);
-        g.drawString(this.font, r.name, rightX + 4, y, TEXT_RIGHT_COLOR, false);
-        int nx = rightX + 4 + this.font.width(r.name) + 6;
-        g.drawString(this.font, r.detail, nx, y, TEXT_RIGHT_SUB, false);
-        y += 12;
-    }
-
-    g.pose().popPose();
-}
-
-
-    // 마우스 휠: 4인자 시그니처(1.20+ 매핑)
-    @Override
-    public boolean mouseScrolled(double mx, double my, double deltaX, double deltaY) {
-        double delta = (Math.abs(deltaY) > 0.0) ? deltaY : deltaX; // 휠 우선, 없으면 수평 스크롤
-        boolean inLeft  = mx >= leftX  && mx < leftX  + colWidth && my >= listTop && my < listTop + listHeight;
-        boolean inRight = mx >= rightX && mx < rightX + colWidth && my >= listTop && my < listTop + listHeight;
-
-        if (inLeft) {
-            int pages = Math.max(1, (int)Math.ceil(boneRows.size() / (double)perPageLeft));
-            bonePage = clamp(bonePage - (int)Math.signum(delta), 0, pages - 1);
-            updatePageLabels();
-            return true;
-        } else if (inRight) {
-            int pages = Math.max(1, (int)Math.ceil(jointRows.size() / (double)perPageRight));
-            jointPage = clamp(jointPage - (int)Math.signum(delta), 0, pages - 1);
-            updatePageLabels();
-            return true;
-        }
-        return super.mouseScrolled(mx, my, deltaX, deltaY);
-    }
-
-    // 키: F5 새로고침, ESC 닫기(기본)
-    @Override
-    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        // GLFW.GLFW_KEY_F5 = 294
-        if (keyCode == 294) {
-            buildData();
-            updatePageLabels();
-            return true;
-        }
-        return super.keyPressed(keyCode, scanCode, modifiers);
+        // 중앙
+        refreshBtn.setX(this.width/2 - 60);
+        refreshBtn.setY(listTop - 26);
     }
 
     @Override
@@ -302,51 +375,101 @@ public void render(GuiGraphics g, int mouseX, int mouseY, float partialTicks) {
         this.minecraft.setScreen(this.parent);
     }
 
-    /* ---------------- 데이터 행 ---------------- */
-    private static class BoneRow {
-        final String name;
-        final String detail;
-        BoneRow(String n, String d) { name = n; detail = d; }
-    }
-    private static class JointRow {
-        final String name;
-        final String detail;
-        JointRow(String n, String d) { name = n; detail = d; }
+    // ===== 작은 구조체 =====
+    private static class Row {
+        final String name, detail;
+        Row(String n, String d) { name = n; detail = d; }
     }
 
-    /* ---------------- VMC reflection ---------------- */
+    // ===== VMC (리플렉션) =====
     private Object reflectGetVmcState() {
         try {
             Class<?> mgr = Class.forName("top.fifthlight.armorstand.vmc.VmcMarionetteManager");
-            Method getState = mgr.getMethod("getState");
-            return getState.invoke(null);
+
+            // getState() 시도
+            try {
+                Method getState = mgr.getMethod("getState");
+                Object s = getState.invoke(null);
+                if (s != null) return s;
+            } catch (NoSuchMethodException ignored) {}
+
+            // public static field state 시도 + state.value
+            try {
+                Field f = mgr.getField("state");
+                Object v = f.get(null);
+                if (v != null) {
+                    try {
+                        Field fv = v.getClass().getField("value");
+                        Object sv = fv.get(v);
+                        if (sv != null) return sv;
+                    } catch (Throwable ignored2) {}
+                    return v;
+                }
+            } catch (Throwable ignored) {}
         } catch (Throwable ignored) {}
         return null;
     }
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> reflectCollectBoneMap(Object vmcState) {
-        Map<String, Object> map = new HashMap<>();
-        if (vmcState == null) return map;
-        try {
-            Field f = vmcState.getClass().getField("boneTransforms");
-            Object raw = f.get(vmcState);
-            if (!(raw instanceof Map)) return map;
-            Map<Object, Object> m = (Map<Object, Object>) raw;
-            for (Map.Entry<Object, Object> e : m.entrySet()) {
-                Object tag = e.getKey();
-                String name = tag.toString();
+        Map<String, Object> out = new HashMap<>();
+        if (vmcState == null) return out;
+
+        Object mapObj = null;
+
+        // 필드 후보
+        String[] fieldCandidates = { "boneTransforms", "bones", "transforms" };
+        for (String fname : fieldCandidates) {
+            try {
+                Field f;
                 try {
-                    Method nameM = tag.getClass().getMethod("name");
-                    Object n = nameM.invoke(tag);
+                    f = vmcState.getClass().getField(fname);
+                } catch (NoSuchFieldException e) {
+                    f = vmcState.getClass().getDeclaredField(fname);
+                    f.setAccessible(true);
+                }
+                mapObj = f.get(vmcState);
+                if (mapObj != null) break;
+            } catch (Throwable ignored) {}
+        }
+
+        // 메서드 후보
+        if (mapObj == null) {
+            String[] methodCandidates = { "getBoneTransforms", "boneTransforms", "getBones", "getTransforms" };
+            for (String mname : methodCandidates) {
+                try {
+                    Method m = vmcState.getClass().getMethod(mname);
+                    mapObj = m.invoke(vmcState);
+                    if (mapObj != null) break;
+                } catch (Throwable ignored) {}
+            }
+        }
+
+        if (!(mapObj instanceof Map)) return out;
+
+        Map<Object, Object> m = (Map<Object, Object>) mapObj;
+        for (Map.Entry<Object, Object> e : m.entrySet()) {
+            Object key = e.getKey();
+            String name = null;
+
+            // Enum이면 name() 우선
+            if (key instanceof Enum<?>) name = ((Enum<?>) key).name();
+
+            if (name == null) {
+                try {
+                    Method nameM = key.getClass().getMethod("name");
+                    Object n = nameM.invoke(key);
                     if (n != null) name = n.toString();
                 } catch (Throwable ignored) {}
-                map.put(name, e.getValue());
             }
-        } catch (Throwable ignored) {}
-        return map;
+            if (name == null) name = (key != null ? key.toString() : "(null)");
+
+            out.put(name, e.getValue());
+        }
+        return out;
     }
 
+    // ===== VMC 트랜스폼 유틸 =====
     private static float[] extractPos(Object transform) {
         float[] r = {0, 0, 0};
         if (transform == null) return r;
@@ -382,7 +505,7 @@ public void render(GuiGraphics g, int mouseX, int mouseY, float partialTicks) {
         return r;
     }
 
-    /* ---------------- URDF access ---------------- */
+    // ===== URDF (리플렉션) =====
     private URDFRobotModel reflectGetRobotModel() {
         try {
             Method m = renderer.getClass().getMethod("getRobotModel");
@@ -391,7 +514,8 @@ public void render(GuiGraphics g, int mouseX, int mouseY, float partialTicks) {
         return null;
     }
 
+    // ===== 유틸 =====
     private static int clamp(int v, int lo, int hi) {
-        return v < lo ? lo : (v > hi ? hi : v);
+        return v < lo ? lo : Math.min(v, hi);
     }
 }
