@@ -18,47 +18,36 @@ import java.lang.reflect.Method;
 import java.util.*;
 
 /**
- * URDFMotionEditor (이름 유지) = "인스펙터" 화면
- * - 좌: VMC HumanoidTag(본) 목록 (position X/Y/Z, Euler pitch/yaw/roll 표시)
- * - 우: URDF 조인트(모터) 목록 (현재값/리밋표시)
- * - 매핑 기능 "전부 제거"
+ * URDFMotionEditor (이름 유지) - 단순 인스펙터 버전
+ * - 매핑 기능 제거
+ * - 좌: VMC HumanoidTag(본) 목록 (position/오일러 요약을 한 줄로)
+ * - 우: URDF Joint(모터) 목록 (현재값/리밋을 한 줄로)
  * - 하단: Refresh / Open Joint Editor / Close
  *
- * 의존성:
- *  - VMC: 리플렉션으로 접근 (top.fifthlight.armorstand.vmc.*)
- *  - renderer: getRobotModel(), GetModelDir() 만 사용(표시용)
- *  - 모터 제어는 여기서 안 함(편집 필요 시 Open Joint Editor 버튼으로 MotionEditorScreen 진입)
- *
- * ObjectSelectionList/렌더 시그니처는 1.19 계열에 맞춤
+ * 주의: 행 높이 커스터마이즈(getRowHeight/getHeight) 오버라이드는 전부 제거(버전 호환).
  */
 public class URDFMotionEditor extends Screen {
 
     private final Screen parent;
-    /** getRobotModel(), GetModelDir() 를 가진 객체 (리플렉션으로 호출) */
     private final Object renderer;
 
-    // UI
     private BoneList boneList;
     private JointList jointList;
     private Button refreshBtn, openJointEditorBtn, closeBtn;
 
-    // 캐시 표시 문자열
     private String status = "";
 
-    // 생성자 (표준)
     public URDFMotionEditor(Screen parent, Object renderer) {
         super(Component.literal("VMC & URDF Inspector"));
         this.parent = parent;
         this.renderer = renderer;
     }
 
-    // 하위호환: 예전 코드가 (URDFRobotModel, URDFSimpleController) 시그니처로 호출 가능
+    // 하위호환: 기존 호출(new URDFMotionEditor(robotModel, ctrl))을 받기 위한 어댑터
     public URDFMotionEditor(URDFRobotModel model, URDFSimpleController ctrl) {
         this(Minecraft.getInstance() != null ? Minecraft.getInstance().screen : null,
              new LegacyRendererAdapter(model));
     }
-
-    /** 최소 어댑터: 표시만 할 거라 setJointPreview 등은 필요 없음 */
     private static final class LegacyRendererAdapter {
         private final URDFRobotModel model;
         LegacyRendererAdapter(URDFRobotModel model) { this.model = model; }
@@ -78,17 +67,14 @@ public class URDFMotionEditor extends Screen {
         final int leftX = margin;
         final int rightX = leftX + colWidth + margin;
 
-        // 좌측: VMC 본 목록
         this.boneList = new BoneList(this.minecraft, colWidth, listHeight, listTop, leftX);
         fillBones();
         this.addWidget(this.boneList);
 
-        // 우측: URDF 조인트 목록
         this.jointList = new JointList(this.minecraft, colWidth, listHeight, listTop, rightX);
         fillJoints();
         this.addWidget(this.jointList);
 
-        // 하단 버튼
         int btnY = listTop + listHeight + 6;
         this.refreshBtn = this.addRenderableWidget(Button.builder(Component.literal("Refresh"), b -> {
             fillBones();
@@ -97,7 +83,6 @@ public class URDFMotionEditor extends Screen {
         }).bounds(margin, btnY, 80, 20).build());
 
         this.openJointEditorBtn = this.addRenderableWidget(Button.builder(Component.literal("Open Joint Editor"), b -> {
-            // 같은 패키지의 MotionEditorScreen 사용
             tryOpenMotionEditor();
         }).bounds(margin + 86, btnY, 140, 20).build());
 
@@ -112,27 +97,24 @@ public class URDFMotionEditor extends Screen {
         Map<String, Object> bones = reflectCollectBoneMap(vmcState);
 
         if (bones.isEmpty()) {
-            this.boneList.children().add(new BoneList.Entry(this.boneList,
-                    "(no VMC state: not running?)",
-                    "(X: -, Y: -, Z: -)",
-                    "(pitch: -, yaw: -, roll: -)",
-                    () -> {}));
+            this.boneList.children().add(new BoneList.Entry(this.boneList, "(no VMC state)", "-", () -> {}));
             return;
         }
 
-        // 정렬: 이름 기준
         List<String> names = new ArrayList<>(bones.keySet());
-        Collections.sort(names, String.CASE_INSENSITIVE_ORDER);
+        names.sort(String.CASE_INSENSITIVE_ORDER);
 
         for (String name : names) {
             Object tr = bones.get(name);
             float[] pos = extractPos(tr);     // x,y,z
             float[] eul = extractEuler(tr);   // pitch,yaw,roll
 
-            String pTxt = String.format(Locale.ROOT, "(X: %.3f, Y: %.3f, Z: %.3f)", pos[0], pos[1], pos[2]);
-            String eTxt = String.format(Locale.ROOT, "(pitch: %.3f, yaw: %.3f, roll: %.3f)", eul[0], eul[1], eul[2]);
+            // 한 줄 요약 (행 높이 18px 기본에 맞춤)
+            String line = String.format(Locale.ROOT,
+                    "X:%.2f Y:%.2f Z:%.2f | p:%.2f y:%.2f r:%.2f",
+                    pos[0], pos[1], pos[2], eul[0], eul[1], eul[2]);
 
-            this.boneList.children().add(new BoneList.Entry(this.boneList, name, pTxt, eTxt, () -> {}));
+            this.boneList.children().add(new BoneList.Entry(this.boneList, name, line, () -> {}));
         }
     }
 
@@ -141,52 +123,34 @@ public class URDFMotionEditor extends Screen {
 
         URDFRobotModel model = reflectGetRobotModel();
         if (model == null || model.joints == null || model.joints.isEmpty()) {
-            this.jointList.children().add(new JointList.Entry(this.jointList,
-                    "(no URDF robot model)", "", "", () -> {}));
+            this.jointList.children().add(new JointList.Entry(this.jointList, "(no URDF robot model)", "", () -> {}));
             return;
         }
 
         for (URDFJoint j : model.joints) {
             String name = j.name != null ? j.name : "(unnamed)";
             float curDeg = (float) Math.toDegrees(j.currentPosition);
-            String curTxt = String.format(Locale.ROOT, "current: %d°", Math.round(curDeg));
-
             String limTxt;
             if (j.limit != null && j.limit.hasLimits() && j.limit.upper > j.limit.lower) {
                 int lo = Math.round((float) Math.toDegrees(j.limit.lower));
                 int hi = Math.round((float) Math.toDegrees(j.limit.upper));
-                limTxt = String.format(Locale.ROOT, "limits: [%d°, %d°]", lo, hi);
+                limTxt = String.format(Locale.ROOT, "cur:%d° | lim:[%d°, %d°]", Math.round(curDeg), lo, hi);
             } else {
-                limTxt = "limits: (none)";
+                limTxt = String.format(Locale.ROOT, "cur:%d° | lim:(none)", Math.round(curDeg));
             }
 
-            this.jointList.children().add(new JointList.Entry(this.jointList, name, curTxt, limTxt, () -> {}));
+            this.jointList.children().add(new JointList.Entry(this.jointList, name, limTxt, () -> {}));
         }
     }
 
     private void tryOpenMotionEditor() {
-        // renderer 가 실제 URDFModelOpenGLWithSTL 타입이면 바로 열고,
-        // 아니면 리플렉션으로 MotionEditorScreen(URDFModelOpenGLWithSTL) 생성 시도
         try {
             if (renderer != null && renderer.getClass().getName().endsWith("URDFModelOpenGLWithSTL")) {
-                // 같은 모듈이라면 직접 호출
-                this.minecraft.setScreen(new MotionEditorScreen((com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL) renderer));
+                this.minecraft.setScreen(new MotionEditorScreen(
+                        (com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL) renderer));
                 return;
             }
         } catch (Throwable ignored) {}
-
-        // 리플렉션 경로
-        try {
-            Class<?> scr = Class.forName("com.kAIS.KAIMyEntity.urdf.control.MotionEditorScreen");
-            Class<?> mdl = Class.forName("com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL");
-            if (renderer != null && mdl.isAssignableFrom(renderer.getClass())) {
-                Object inst = scr.getConstructor(mdl).newInstance(renderer);
-                Method setScreen = Minecraft.getInstance().getClass().getMethod("setScreen", Screen.class);
-                setScreen.invoke(Minecraft.getInstance(), inst);
-                return;
-            }
-        } catch (Throwable ignored) {}
-
         this.status = "MotionEditorScreen not available.";
     }
 
@@ -201,14 +165,12 @@ public class URDFMotionEditor extends Screen {
         g.drawString(this.font, "VMC Humanoid Tags (Bones)", 8, 6, 0xFFD770, false);
         g.drawString(this.font, "URDF Motors (Joints)", this.width / 2 + 8, 6, 0xFFD770, false);
 
-        if (!this.status.isEmpty()) {
+        if (!this.status.isEmpty())
             g.drawString(this.font, this.status, 8, this.height - 28, 0x80FF80, false);
-        }
         super.render(g, mouseX, mouseY, partialTicks);
     }
 
-    /* ===================== VMC 리플렉션 유틸 ===================== */
-
+    /* ------------- VMC reflection ------------- */
     private Object reflectGetVmcState() {
         try {
             Class<?> mgr = Class.forName("top.fifthlight.armorstand.vmc.VmcMarionetteManager");
@@ -242,7 +204,7 @@ public class URDFMotionEditor extends Screen {
     }
 
     private float[] extractPos(Object transform) {
-        float[] r = new float[]{0,0,0};
+        float[] r = {0, 0, 0};
         if (transform == null) return r;
         try {
             Object pos = transform.getClass().getField("position").get(transform);
@@ -257,7 +219,7 @@ public class URDFMotionEditor extends Screen {
     }
 
     private float[] extractEuler(Object transform) {
-        float[] r = new float[]{0,0,0}; // pitch,yaw,roll
+        float[] r = {0, 0, 0};
         if (transform == null) return r;
         try {
             Object rot = transform.getClass().getField("rotation").get(transform);
@@ -276,8 +238,7 @@ public class URDFMotionEditor extends Screen {
         return r;
     }
 
-    /* ===================== URDF 접근 유틸 ===================== */
-
+    /* ------------- URDF reflection ------------- */
     private URDFRobotModel reflectGetRobotModel() {
         try {
             Method m = renderer.getClass().getMethod("getRobotModel");
@@ -286,9 +247,9 @@ public class URDFMotionEditor extends Screen {
         return null;
     }
 
-    /* ===================== 리스트 위젯 ===================== */
+    /* ------------- Lists ------------- */
 
-    /** 좌: 본 목록 */
+    /** 좌: 본 목록 (한 줄 요약) */
     private static class BoneList extends ObjectSelectionList<BoneList.Entry> {
         final int left;
         public BoneList(Minecraft mc, int width, int height, int top, int left) {
@@ -297,41 +258,33 @@ public class URDFMotionEditor extends Screen {
         }
         @Override public int getRowWidth() { return this.width - 8; }
         @Override public int getRowLeft() { return this.left + 4; }
-        @Override public int getX() { return this.left; }
 
         static class Entry extends ObjectSelectionList.Entry<Entry> {
             private final BoneList owner;
-            private final String name, posText, eulText;
+            private final String name, line;
             private final Runnable onSelect;
 
-            Entry(BoneList owner, String name, String posText, String eulText, Runnable onSelect) {
-                this.owner = owner; this.name = name; this.posText = posText; this.eulText = eulText; this.onSelect = onSelect;
+            Entry(BoneList owner, String name, String line, Runnable onSelect) {
+                this.owner = owner; this.name = name; this.line = line; this.onSelect = onSelect;
             }
-
             @Override
             public void render(GuiGraphics g, int idx, int top, int left, int width, int height,
                                int mouseX, int mouseY, boolean hovered, float partialTicks) {
                 var font = Minecraft.getInstance().font;
-                g.drawString(font, name, left + 2, top + 2, 0xFFFFFF, false);
-                g.drawString(font, posText, left + 12, top + 12, 0xA0E0FF, false);
-                g.drawString(font, eulText, left + 12, top + 22, 0xFFE0A0, false);
+                g.drawString(font, name, left + 2, top + 4, 0xFFFFFF, false);
+                g.drawString(font, line, left + 120, top + 4, 0xA0E0FF, false);
             }
-
-            @Override
-            public boolean mouseClicked(double mouseX, double mouseY, int button) {
-                if (button == 0) { owner.setSelected(this); onSelect.run(); return true; }
+            @Override public boolean mouseClicked(double x, double y, int b) {
+                if (b == 0) { owner.setSelected(this); onSelect.run(); return true; }
                 return false;
             }
-
             @Override public Component getNarration() {
-                return Component.literal(name + " " + posText + " " + eulText);
+                return Component.literal(name + " " + line);
             }
-
-            @Override public int getHeight() { return 34; }
         }
     }
 
-    /** 우: 조인트 목록 */
+    /** 우: 조인트 목록 (한 줄 요약) */
     private static class JointList extends ObjectSelectionList<JointList.Entry> {
         final int left;
         public JointList(Minecraft mc, int width, int height, int top, int left) {
@@ -340,37 +293,29 @@ public class URDFMotionEditor extends Screen {
         }
         @Override public int getRowWidth() { return this.width - 8; }
         @Override public int getRowLeft() { return this.left + 4; }
-        @Override public int getX() { return this.left; }
 
         static class Entry extends ObjectSelectionList.Entry<Entry> {
             private final JointList owner;
-            private final String name, curText, limText;
+            private final String name, line;
             private final Runnable onSelect;
 
-            Entry(JointList owner, String name, String curText, String limText, Runnable onSelect) {
-                this.owner = owner; this.name = name; this.curText = curText; this.limText = limText; this.onSelect = onSelect;
+            Entry(JointList owner, String name, String line, Runnable onSelect) {
+                this.owner = owner; this.name = name; this.line = line; this.onSelect = onSelect;
             }
-
             @Override
             public void render(GuiGraphics g, int idx, int top, int left, int width, int height,
                                int mouseX, int mouseY, boolean hovered, float partialTicks) {
                 var font = Minecraft.getInstance().font;
-                g.drawString(font, name, left + 2, top + 2, 0xFFFFFF, false);
-                g.drawString(font, curText, left + 12, top + 12, 0xB0FFA0, false);
-                g.drawString(font, limText, left + 12, top + 22, 0xC0C0C0, false);
+                g.drawString(font, name, left + 2, top + 4, 0xFFFFFF, false);
+                g.drawString(font, line, left + 120, top + 4, 0xB0FFA0, false);
             }
-
-            @Override
-            public boolean mouseClicked(double mouseX, double mouseY, int button) {
-                if (button == 0) { owner.setSelected(this); onSelect.run(); return true; }
+            @Override public boolean mouseClicked(double x, double y, int b) {
+                if (b == 0) { owner.setSelected(this); onSelect.run(); return true; }
                 return false;
             }
-
             @Override public Component getNarration() {
-                return Component.literal(name + " " + curText + " " + limText);
+                return Component.literal(name + " " + line);
             }
-
-            @Override public int getHeight() { return 34; }
         }
     }
 }
