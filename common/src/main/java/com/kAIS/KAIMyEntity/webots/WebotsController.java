@@ -202,9 +202,10 @@ public class WebotsController {
                 if (response.statusCode() == 200) {
                     connected = true;
                     failureCount.set(0);
-                    LOGGER.info("✅ Connected to Webots: {}", webotsUrl);
+                    LOGGER.info("Connected to Webots: {}", webotsUrl);
                 } else {
-                    LOGGER.warn("⚠️  Webots returned status {}", response.statusCode());
+                    connected = false;
+                    LOGGER.warn("Webots returned status {} for get_stats", response.statusCode());
                 }
             } catch (Exception e) {
                 connected = false;
@@ -280,29 +281,34 @@ public class WebotsController {
         executor.submit(() -> sendBatch(frame));
     }
 
-    // 큐 프로세스: 드레인 + 코얼레싱
+    // 큐 프로세스: 드레인 + 코얼레싱 -> 배치 전송(set_joints)
     private void processQueue() {
         List<Command> drained = new ArrayList<>();
         commandQueue.drainTo(drained);
         if (drained.isEmpty()) return;
 
-        Float[] lastByIndex = new Float[NMOTORS];
-        for (Command c : drained) lastByIndex[c.index] = c.value;
+        Float[] frame = new Float[NMOTORS];
+        Arrays.fill(frame, Float.NaN);
 
-        executor.submit(() -> {
-            for (int i = 0; i < NMOTORS; i++) {
-                if (lastByIndex[i] != null) {
-                    sendToWebots(i, lastByIndex[i]);
-                }
-            }
-        });
+        // 같은 index는 마지막 값으로 코얼레싱
+        for (Command c : drained) {
+            frame[c.index] = c.value;
+        }
+
+        // 모두 NaN이면 보낼 필요 없음
+        boolean any = false;
+        for (Float f : frame) {
+            if (f != null && !Float.isNaN(f)) { any = true; break; }
+        }
+        if (!any) return;
+
+        executor.submit(() -> sendBatch(frame));
     }
 
     private void sendBatch(Float[] values) {
         if (!connected && failureCount.get() > MAX_FAILURES) return;
 
         try {
-            // NaN은 문자열 "nan"으로 보내고, 서버는 이를 건너뜀
             StringBuilder sb = new StringBuilder();
             sb.append(webotsUrl).append("/?command=set_joints&v=");
             for (int i = 0; i < NMOTORS; i++) {
@@ -314,36 +320,63 @@ public class WebotsController {
 
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(sb.toString()))
-                    .timeout(Duration.ofMillis(120))
+                    .timeout(Duration.ofMillis(200))
                     .GET()
                     .build();
 
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            int sc = response.statusCode();
 
-            if (response.statusCode() == 200) {
-                stats.sent += NMOTORS; // 대략 집계
+            if (sc == 200) {
+                stats.sent += NMOTORS;
                 failureCount.set(0);
+
                 for (int i = 0; i < NMOTORS; i++) {
                     Float v = values[i];
                     if (v != null && !Float.isNaN(v)) lastFrame[i] = v;
                 }
+
                 if (!connected) {
                     connected = true;
-                    LOGGER.info("✅ Reconnected to Webots");
+                    LOGGER.info("Reconnected to Webots (batch)");
                 }
-            } else {
-                stats.failed++;
-                LOGGER.warn("⚠️  Webots returned status {}", response.statusCode());
+                return;
             }
+
+            // ---- 여기부터: status != 200 처리 ----
+            stats.failed++;
+            int failures = failureCount.incrementAndGet();
+
+            // 서버가 set_joints를 지원 안 하는 경우(404 등) -> set_joint로 폴백 시도
+            if (sc == 404 || sc == 400) {
+                LOGGER.warn("Webots batch unsupported or bad request (status={}). Fallback to per-joint.", sc);
+
+                // 폴백: 값 있는 것만 단건 전송
+                for (int i = 0; i < NMOTORS; i++) {
+                    Float v = values[i];
+                    if (v != null && !Float.isNaN(v)) {
+                        sendToWebots(i, v);
+                    }
+                }
+                return;
+            }
+
+            if (failures >= MAX_FAILURES) {
+                connected = false;
+                LOGGER.error("Connection lost to Webots after {} failures (status={})", failures, sc);
+            } else {
+                LOGGER.warn("Webots returned status {} (failures={})", sc, failures);
+            }
+
         } catch (Exception e) {
             stats.failed++;
             int failures = failureCount.incrementAndGet();
 
-            if (failures == MAX_FAILURES) {
+            if (failures >= MAX_FAILURES) {
                 connected = false;
-                LOGGER.error("❌ Connection lost to Webots after {} failures", MAX_FAILURES);
-            } else if (failures % 50 == 0) {
-                LOGGER.warn("⚠️  Failed to send batch to Webots ({} failures): {}", failures, e.getMessage());
+                LOGGER.error("Connection lost to Webots after {} failures: {}", failures, e.getMessage());
+            } else if (failures % 10 == 0) {
+                LOGGER.warn("Failed to send batch ({} failures): {}", failures, e.getMessage());
             }
         }
     }
@@ -376,14 +409,21 @@ public class WebotsController {
                 }
             } else {
                 stats.failed++;
-                LOGGER.warn("⚠️  Webots returned status {}", response.statusCode());
+                int failures = failureCount.incrementAndGet();
+                if (failures >= MAX_FAILURES) {
+                    connected = false;
+                    LOGGER.error("Connection lost to Webots after {} failures (status={})",
+                            failures, response.statusCode());
+                } else {
+                    LOGGER.warn("Webots returned status {}", response.statusCode());
+                }
             }
 
         } catch (Exception e) {
             stats.failed++;
             int failures = failureCount.incrementAndGet();
 
-            if (failures == MAX_FAILURES) {
+            if (failures >= MAX_FAILURES) {
                 connected = false;
                 LOGGER.error("❌ Connection lost to Webots after {} failures", MAX_FAILURES);
             } else if (failures % 50 == 0) {
