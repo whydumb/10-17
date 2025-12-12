@@ -142,7 +142,8 @@ public final class PosePipeline {
 
         if (enableWebotsSend && !frameScratch.isEmpty()) {
             WebotsController wc = getWebots();
-            if (wc != null && wc.isConnected()) {
+            if (wc != null) {
+                // ✅ connected 여부와 상관없이 전송 시도하게 해야 "초기 false"에서 영구 차단이 안 걸림
                 wc.sendFrame(frameScratch);
             }
         }
