@@ -73,32 +73,6 @@ public class WebotsController {
         JOINT_MAP.put("l_ank_pitch", new JointMapping("AnkleL", 15, -1.39f, 1.22f));
         JOINT_MAP.put("r_ank_roll",  new JointMapping("FootR",  16, -0.87f, 0.87f));
         JOINT_MAP.put("l_ank_roll",  new JointMapping("FootL",  17, -0.87f, 0.87f));
-
-        // 역호환(이름 그대로 들어오는 경우)
-        for (var e : List.of(
-                new JointMapping("ShoulderR", 0, -1.57f, 0.52f),
-                new JointMapping("ShoulderL", 1, -1.57f, 0.52f),
-                new JointMapping("ArmUpperR", 2, -0.15f, 2.30f),
-                new JointMapping("ArmUpperL", 3, -2.25f, 0.15f),
-                new JointMapping("ArmLowerR", 4, -1.57f, -0.10f),
-                new JointMapping("ArmLowerL", 5, -1.57f, -0.10f),
-                new JointMapping("PelvYR", 6, -1.047f, 1.047f),
-                new JointMapping("PelvYL", 7, -0.69f, 2.50f),
-                new JointMapping("PelvR", 8, -1.01f, 1.01f),
-                new JointMapping("PelvL", 9, -0.35f, 0.35f),
-                new JointMapping("LegUpperR", 10, -2.50f, 0.87f),
-                new JointMapping("LegUpperL", 11, -2.50f, 0.87f),
-                new JointMapping("LegLowerR", 12, -0.10f, 2.09f),
-                new JointMapping("LegLowerL", 13, -0.10f, 2.09f),
-                new JointMapping("AnkleR", 14, -0.87f, 0.87f),
-                new JointMapping("AnkleL", 15, -1.39f, 1.22f),
-                new JointMapping("FootR", 16, -0.87f, 0.87f),
-                new JointMapping("FootL", 17, -0.87f, 0.87f),
-                new JointMapping("Neck", 18, -1.57f, 1.57f),
-                new JointMapping("Head", 19, -0.52f, 0.52f)
-        )) {
-            JOINT_MAP.put(e.webotsName, e);
-        }
     }
 
     private WebotsController(String ip, int port) {
@@ -198,27 +172,36 @@ public class WebotsController {
     public String getRobotAddress() { return String.format("%s:%d", robotIp, robotPort); }
 
     public void setJoint(String jointName, float urdfValue) {
-        JointMapping m = JOINT_MAP.get(jointName);
+        // ✅ 1. 먼저 정규화
+        String canon = normalizeJointName(jointName);
+        
+        // ✅ 2. canon 기준으로 매핑 조회
+        JointMapping m = JOINT_MAP.get(canon);
         if (m == null) {
             warnUnknownJoint(jointName, "setJoint");
             return;
         }
 
-        // ✅ 정규화 추가
-        String canon = normalizeJointName(jointName);
-
+        // ✅ 3. URDF → Webots 변환
         float v = convertUrdfToWebots(canon, urdfValue);
         v = clamp(v, m.min, m.max);
 
-        Float last = lastSentByName.get(jointName);
+        // ✅ 4. 축 반전 (오른팔 + 머리)
+        if (shouldFlipInWebotsSpace(m.index)) {
+            v = flipInRange(v, m.min, m.max);
+        }
+
+        // ✅ 5. 델타 스킵 체크 (canon 키로)
+        Float last = lastSentByName.get(canon);
         float dth = getDeltaThreshold(m.index);
         if (last != null && Math.abs(v - last) < dth) {
             stats.deltaSkipped++;
             return;
         }
 
+        // ✅ 6. 큐에 추가 (canon 키로 lastSent 업데이트)
         if (commandQueue.offer(new Command(m.index, v))) {
-            lastSentByName.put(jointName, v);
+            lastSentByName.put(canon, v);
             stats.queued++;
         } else {
             stats.queueFull++;
@@ -236,20 +219,30 @@ public class WebotsController {
 
         for (var e : jointsUrdf.entrySet()) {
             String name = e.getKey();
-            JointMapping m = JOINT_MAP.get(name);
+            
+            // ✅ 1. 먼저 정규화
+            String canon = normalizeJointName(name);
+            
+            // ✅ 2. canon 기준으로 매핑 조회
+            JointMapping m = JOINT_MAP.get(canon);
             if (m == null) {
                 if (unknown++ < 5) warnUnknownJoint(name, "sendFrame");
                 continue;
             }
+            
             Float uv = e.getValue();
             if (uv == null || Float.isNaN(uv)) continue;
 
-            // ✅ 정규화 추가
-            String canon = normalizeJointName(name);
-
+            // ✅ 3. URDF → Webots 변환
             float v = convertUrdfToWebots(canon, uv);
             v = clamp(v, m.min, m.max);
 
+            // ✅ 4. 축 반전 (오른팔 + 머리)
+            if (shouldFlipInWebotsSpace(m.index)) {
+                v = flipInRange(v, m.min, m.max);
+            }
+
+            // ✅ 5. 델타 스킵 체크
             Float last = lastFrame[m.index];
             float dth = getDeltaThreshold(m.index);
             if (last != null && Math.abs(v - last) < dth) continue;
@@ -259,7 +252,6 @@ public class WebotsController {
         }
 
         if (mapped == 0) return;
-
         realtimePendingFrame.set(frame);
     }
 
@@ -413,6 +405,79 @@ public class WebotsController {
         if (n <= 3) LOGGER.warn("[{}] Unknown joint: {} ({} of 3)", where, jointName, n);
     }
 
+    // ==================== 축 반전 로직 ====================
+    
+    /**
+     * Webots 공간에서 "방향 반전"이 필요한 관절 판별
+     * 오른팔: ShoulderR(0), ArmUpperR(2), ArmLowerR(4)
+     * 머리: Neck(18), Head(19)
+     */
+    private boolean shouldFlipInWebotsSpace(int index) {
+        return index == 0 || index == 2 || index == 4 || index == 18 || index == 19;
+    }
+
+    /**
+     * 범위 내에서 값을 미러링 (방향 반전)
+     * v' = (min + max) - v
+     */
+    private float flipInRange(float v, float min, float max) {
+        return (min + max) - v;
+    }
+
+    // ==================== 정규화 & 변환 ====================
+
+    /**
+     * Webots alias를 URDF 표준 키로 정규화
+     */
+    private String normalizeJointName(String jointName) {
+        if (jointName == null) return null;
+        return switch (jointName) {
+            // 팔꿈치
+            case "ArmLowerR" -> "r_el";
+            case "ArmLowerL" -> "l_el";
+
+            // 어깨
+            case "ShoulderR" -> "r_sho_pitch";
+            case "ShoulderL" -> "l_sho_pitch";
+            case "ArmUpperR" -> "r_sho_roll";
+            case "ArmUpperL" -> "l_sho_roll";
+
+            // 머리
+            case "Neck" -> "head_pan";
+            case "Head" -> "head_tilt";
+
+            // 하체
+            case "PelvYR" -> "r_hip_yaw";
+            case "PelvYL" -> "l_hip_yaw";
+            case "PelvR" -> "r_hip_roll";
+            case "PelvL" -> "l_hip_roll";
+            case "LegUpperR" -> "r_hip_pitch";
+            case "LegUpperL" -> "l_hip_pitch";
+            case "LegLowerR" -> "r_knee";
+            case "LegLowerL" -> "l_knee";
+            case "AnkleR" -> "r_ank_pitch";
+            case "AnkleL" -> "l_ank_pitch";
+            case "FootR" -> "r_ank_roll";
+            case "FootL" -> "l_ank_roll";
+
+            default -> jointName;
+        };
+    }
+
+    private float convertUrdfToWebots(String jointName, float urdfValue) {
+        return switch (jointName) {
+            case "r_el" -> map(urdfValue, 0.0f, 2.7925f, -0.10f, -1.57f);
+            case "l_el" -> map(urdfValue, -2.7925f, 0.0f, -1.57f, -0.10f);
+            case "r_knee", "l_knee" -> map(urdfValue, -2.27f, 0.0f, 2.09f, -0.1f);
+            case "head_pan"  -> clamp(urdfValue, -1.57f, 1.57f);
+            case "head_tilt" -> clamp(urdfValue, -0.52f, 0.52f);
+            case "l_ank_pitch" -> clamp(urdfValue, -1.39f, 1.22f);
+            case "r_hip_yaw"   -> clamp(urdfValue, -1.047f, 1.047f);
+            case "l_hip_yaw"   -> clamp(urdfValue, -0.69f, 2.50f);
+            default -> urdfValue;
+        };
+    }
+
     // -------------------- 내부 클래스/유틸 --------------------
 
     private static class Command {
@@ -449,56 +514,6 @@ public class WebotsController {
         if (index >= 0 && index <= 3) return 0.0035f;
         if (index >= 6 && index <= 17) return 0.0050f;
         return DEFAULT_DELTA_THRESHOLD;
-    }
-
-    // ✅ 핵심: Webots alias를 URDF 표준 키로 정규화
-    private String normalizeJointName(String jointName) {
-        if (jointName == null) return null;
-        return switch (jointName) {
-            // 팔꿈치 (가장 중요!)
-            case "ArmLowerR" -> "r_el";
-            case "ArmLowerL" -> "l_el";
-
-            // 어깨
-            case "ShoulderR" -> "r_sho_pitch";
-            case "ShoulderL" -> "l_sho_pitch";
-            case "ArmUpperR" -> "r_sho_roll";
-            case "ArmUpperL" -> "l_sho_roll";
-
-            // 머리
-            case "Neck" -> "head_pan";
-            case "Head" -> "head_tilt";
-
-            // 하체 (필요시)
-            case "PelvYR" -> "r_hip_yaw";
-            case "PelvYL" -> "l_hip_yaw";
-            case "PelvR" -> "r_hip_roll";
-            case "PelvL" -> "l_hip_roll";
-            case "LegUpperR" -> "r_hip_pitch";
-            case "LegUpperL" -> "l_hip_pitch";
-            case "LegLowerR" -> "r_knee";
-            case "LegLowerL" -> "l_knee";
-            case "AnkleR" -> "r_ank_pitch";
-            case "AnkleL" -> "l_ank_pitch";
-            case "FootR" -> "r_ank_roll";
-            case "FootL" -> "l_ank_roll";
-
-            default -> jointName;
-        };
-    }
-
-    private float convertUrdfToWebots(String jointName, float urdfValue) {
-        return switch (jointName) {
-            case "r_el" -> map(urdfValue, 0.0f, 2.7925f, -0.10f, -1.57f);
-            case "l_el" -> map(urdfValue, -2.7925f, 0.0f, -1.57f, -0.10f);
-            case "r_knee", "l_knee" -> map(urdfValue, -2.27f, 0.0f, 2.09f, -0.1f);
-            case "head_pan"  -> clamp(urdfValue, -1.57f, 1.57f);
-            case "head_tilt" -> clamp(urdfValue, -0.52f, 0.52f);
-            case "l_ank_pitch" -> clamp(urdfValue, -1.39f, 1.22f);
-            case "r_hip_yaw"   -> clamp(urdfValue, -1.047f, 1.047f);
-            case "l_hip_yaw"   -> clamp(urdfValue, -0.69f, 2.50f);
-            default -> urdfValue;
-        };
     }
 
     private float map(float v, float fromLow, float fromHigh, float toLow, float toHigh) {
