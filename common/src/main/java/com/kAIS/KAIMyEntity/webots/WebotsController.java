@@ -75,21 +75,26 @@ public class WebotsController {
         JOINT_MAP.put("l_ank_roll",  new JointMapping("FootL",  17, -0.87f, 0.87f));
     }
 
+    // ==================== 방향(축) 보정 정책 ====================
+
     /**
-     * ✅ "방향이 반대"인 관절 목록
-     * - 여기 있는 관절은 URDF->Webots 변환 후 v = -v 를 적용합니다.
-     *
-     * 네 증상 기준 기본값:
-     *  - 머리 좌우 반대 => head_pan
-     *  - (오른)어깨 위아래 반대 => r_sho_pitch (필요시 r_sho_roll도)
-     *
-     * 만약 r_sho_roll을 넣었는데 옆으로 벌리는 움직임이 이상해지면
-     * r_sho_roll을 Set에서 빼고 r_sho_pitch만 유지해.
+     * 머리 좌/우 반대였다고 했으니 head_pan은 단순 부호 반전.
+     * (범위가 대칭이라 -v와 range-mirror가 같은 효과)
      */
-    private static final Set<String> INVERT_SIGN_JOINTS = Set.of(
-            "head_pan",
-            "r_sho_pitch",
-            "r_sho_roll"
+    private static final Set<String> NEGATE_JOINTS = Set.of(
+            "head_pan"
+    );
+
+    /**
+     * ✅ "팔을 올리면 내려간다" 같은 문제는 단순 -v가 아니라
+     *    (0을 0으로 유지하면서) 범위 내에서 방향만 뒤집는 게 더 안정적임.
+     *
+     * 여기서는 좌/우 어깨 pitch를 둘 다 적용해서
+     * "협응 유지 + 전체 방향 바로잡기"를 목표로 함.
+     */
+    private static final Set<String> ZERO_ANCHOR_MIRROR_JOINTS = Set.of(
+            "l_sho_pitch",
+            "r_sho_pitch"
     );
 
     private WebotsController(String ip, int port) {
@@ -189,29 +194,17 @@ public class WebotsController {
     public String getRobotAddress() { return String.format("%s:%d", robotIp, robotPort); }
 
     public void setJoint(String jointName, float urdfValue) {
-        // ✅ 1. 정규화
         String canon = normalizeJointName(jointName);
         if (canon == null) return;
 
-        // ✅ 2. 매핑 조회
         JointMapping m = JOINT_MAP.get(canon);
         if (m == null) {
             warnUnknownJoint(jointName, "setJoint");
             return;
         }
 
-        // ✅ 3. URDF → Webots 변환
-        float v = convertUrdfToWebots(canon, urdfValue);
+        float v = toWebotsPosition(canon, m, urdfValue);
 
-        // ✅ 4. 방향(sign) 반전 (0은 그대로 유지됨)
-        if (INVERT_SIGN_JOINTS.contains(canon)) {
-            v = -v;
-        }
-
-        // ✅ 5. clamp
-        v = clamp(v, m.min, m.max);
-
-        // ✅ 6. 델타 스킵 체크
         Float last = lastSentByName.get(canon);
         float dth = getDeltaThreshold(m.index);
         if (last != null && Math.abs(v - last) < dth) {
@@ -219,7 +212,6 @@ public class WebotsController {
             return;
         }
 
-        // ✅ 7. 큐에 추가
         if (commandQueue.offer(new Command(m.index, v))) {
             lastSentByName.put(canon, v);
             stats.queued++;
@@ -238,34 +230,20 @@ public class WebotsController {
         int mapped = 0, unknown = 0;
 
         for (var e : jointsUrdf.entrySet()) {
-            String name = e.getKey();
-
-            // ✅ 1. 정규화
-            String canon = normalizeJointName(name);
+            String canon = normalizeJointName(e.getKey());
             if (canon == null) continue;
 
-            // ✅ 2. 매핑 조회
             JointMapping m = JOINT_MAP.get(canon);
             if (m == null) {
-                if (unknown++ < 5) warnUnknownJoint(name, "sendFrame");
+                if (unknown++ < 5) warnUnknownJoint(e.getKey(), "sendFrame");
                 continue;
             }
 
             Float uv = e.getValue();
             if (uv == null || Float.isNaN(uv)) continue;
 
-            // ✅ 3. URDF → Webots 변환
-            float v = convertUrdfToWebots(canon, uv);
+            float v = toWebotsPosition(canon, m, uv);
 
-            // ✅ 4. 방향(sign) 반전
-            if (INVERT_SIGN_JOINTS.contains(canon)) {
-                v = -v;
-            }
-
-            // ✅ 5. clamp
-            v = clamp(v, m.min, m.max);
-
-            // ✅ 6. 델타 스킵 체크
             Float last = lastFrame[m.index];
             float dth = getDeltaThreshold(m.index);
             if (last != null && Math.abs(v - last) < dth) continue;
@@ -297,6 +275,71 @@ public class WebotsController {
         tick50hz.shutdownNow();
         io.shutdownNow();
         LOGGER.info("✅ WebotsController shutdown complete");
+    }
+
+    // -------------------- 핵심 변환 파이프라인 --------------------
+
+    private float toWebotsPosition(String canon, JointMapping m, float urdfValue) {
+        float v = convertUrdfToWebots(canon, urdfValue);
+
+        // 1) 방향 보정 (joint별 정책)
+        if (ZERO_ANCHOR_MIRROR_JOINTS.contains(canon)) {
+            v = mirrorDirectionKeepZero(v, m.min, m.max);
+        } else if (NEGATE_JOINTS.contains(canon)) {
+            v = -v;
+        }
+
+        // 2) clamp
+        return clamp(v, m.min, m.max);
+    }
+
+    /**
+     * URDF 관절값 -> Webots 관절값 변환
+     * - 어깨는 기본적으로 urdfValue 그대로 사용 (방향/범위 보정은 위 단계에서 처리)
+     * - 팔꿈치는 부호가 들어와도 움직이도록 abs 기반으로 "굽힘량"만 반영
+     */
+    private float convertUrdfToWebots(String jointName, float urdfValue) {
+        return switch (jointName) {
+            case "r_el", "l_el" -> {
+                float u = Math.abs(urdfValue);
+                // 0(펴짐) -> -0.10, |u| 커질수록 -> -1.57 (굽힘)
+                yield map(u, 0.0f, 2.7925f, -0.10f, -1.57f);
+            }
+
+            case "r_knee", "l_knee" -> map(urdfValue, -2.27f, 0.0f, 2.09f, -0.10f);
+
+            case "head_pan"  -> clamp(urdfValue, -1.57f, 1.57f);
+            case "head_tilt" -> clamp(urdfValue, -0.52f, 0.52f);
+
+            case "l_ank_pitch" -> clamp(urdfValue, -1.39f, 1.22f);
+            case "r_hip_yaw"   -> clamp(urdfValue, -1.047f, 1.047f);
+            case "l_hip_yaw"   -> clamp(urdfValue, -0.69f, 2.50f);
+
+            default -> urdfValue;
+        };
+    }
+
+    /**
+     * ✅ 0은 0으로 유지하면서, 범위 [min,max] 안에서 방향만 뒤집기
+     *
+     * 요구사항: min < 0 < max (0이 범위 내부에 있어야 "0 고정"이 의미 있음)
+     * - v >= 0 : [0..max] -> [0..min] 으로 매핑(내림)
+     * - v <  0 : [min..0] -> [max..0] 으로 매핑(올림)
+     *
+     * 이렇게 하면 "올리면 내려간다"를 뒤집으면서도
+     * 중립(0)은 유지되고, 비대칭 범위에서도 clamp로 방향이 깨지는 일이 줄어듦.
+     */
+    private float mirrorDirectionKeepZero(float v, float min, float max) {
+        if (!(min < 0f && max > 0f)) {
+            // 0이 범위 안이 아니면 이 방식은 의미 없음 -> 범위 미러로 fallback
+            return (min + max) - v;
+        }
+
+        if (v >= 0f) {
+            return map(v, 0f, max, 0f, min);
+        } else {
+            return map(v, min, 0f, max, 0f);
+        }
     }
 
     // -------------------- 50Hz flush loop --------------------
@@ -428,11 +471,8 @@ public class WebotsController {
         if (n <= 3) LOGGER.warn("[{}] Unknown joint: {} ({} of 3)", where, jointName, n);
     }
 
-    // ==================== 정규화 & 변환 ====================
+    // ==================== 정규화 ====================
 
-    /**
-     * Webots alias를 URDF 표준 키로 정규화
-     */
     private String normalizeJointName(String jointName) {
         if (jointName == null) return null;
         String j = jointName.trim();
@@ -471,35 +511,6 @@ public class WebotsController {
         };
     }
 
-    /**
-     * URDF 관절값을 Webots 모터 포지션으로 변환
-     */
-    private float convertUrdfToWebots(String jointName, float urdfValue) {
-        return switch (jointName) {
-
-            // ✅ 팔꿈치: "부호가 뭐로 오든" 굽힘량(abs) 기반으로 매핑
-            // - URDF가 +로 오든 -로 오든 움직이게 함
-            // - 0 -> 거의 펼침(-0.10), |urdf| 커질수록 더 굽힘(-1.57)
-            case "r_el", "l_el" -> {
-                float u = Math.abs(urdfValue);
-                yield map(u, 0.0f, 2.7925f, -0.10f, -1.57f);
-            }
-
-            // 무릎 (기존 유지)
-            case "r_knee", "l_knee" -> map(urdfValue, -2.27f, 0.0f, 2.09f, -0.10f);
-
-            // 머리/특정 관절은 clamp
-            case "head_pan"  -> clamp(urdfValue, -1.57f, 1.57f);
-            case "head_tilt" -> clamp(urdfValue, -0.52f, 0.52f);
-
-            case "l_ank_pitch" -> clamp(urdfValue, -1.39f, 1.22f);
-            case "r_hip_yaw"   -> clamp(urdfValue, -1.047f, 1.047f);
-            case "l_hip_yaw"   -> clamp(urdfValue, -0.69f, 2.50f);
-
-            default -> urdfValue;
-        };
-    }
-
     // -------------------- 내부 클래스/유틸 --------------------
 
     private static class Command {
@@ -513,7 +524,10 @@ public class WebotsController {
         public final int index;
         public final float min, max;
         public JointMapping(String webotsName, int index, float min, float max) {
-            this.webotsName = webotsName; this.index = index; this.min = min; this.max = max;
+            this.webotsName = webotsName;
+            this.index = index;
+            this.min = min;
+            this.max = max;
         }
     }
 
