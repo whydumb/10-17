@@ -1,6 +1,7 @@
 package com.kAIS.KAIMyEntity.urdf;
 
 import com.kAIS.KAIMyEntity.renderer.IMMDModel;
+import com.kAIS.KAIMyEntity.urdf.control.URDFSimpleController;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
@@ -8,30 +9,20 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.phys.Vec3;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.joml.Matrix3f;
-import org.joml.Matrix3fc;
 import org.joml.Matrix4f;
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
 import java.io.File;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.LinkedHashMap;
-import java.util.Map;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * URDF 모델 렌더링 (STL 메시 포함)
- *
- * - 루트에서만 업라이트 보정(ROS/STL 좌표 → Minecraft) 1회 적용
- *   · Up을 먼저 정확히 맞추고 → Up에 수직인 평면에서 Forward만 정렬 (롤 꼬임 방지)
- * - 링크/조인트 원점/축은 원본 좌표 기준 (추가 보정 없음)
- *
- * + (추가) Tracking(VMC) Space -> URDF Base Space 변환 모듈
- *   · VMC(보통 Unity 좌표계)에서 온 rotation/position을 URDF 기준으로 변환하는 기저(Basis)를
- *     URDFModelOpenGLWithSTL 안에서 명시적으로 관리
+ * URDF 모델 렌더링 + ODE4J 물리 통합 + 블록 충돌 연동 버전
  */
 public class URDFModelOpenGLWithSTL implements IMMDModel {
     private static final Logger logger = LogManager.getLogger();
@@ -40,57 +31,118 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
     private URDFModel robotModel;
     private String modelDir;
 
-    // 메시 캐시: link.name -> mesh
+    private final URDFSimpleController controller;
     private final Map<String, STLLoader.STLMesh> meshCache = new HashMap<>();
 
-    // 전역 스케일
-    private static final float GLOBAL_SCALE = 5.0f;
+    // 렌더 전용 스케일 (물리는 1블록 = 1m 기준으로 동작)
+    // 물리 스케일과 맞추려면 1.0f, 시각적으로만 크게 보이고 싶으면 5.0f 등으로 조정
+    private static final float GLOBAL_SCALE = 1.0f;
 
-    // 법선 반전(필요 시)
     private static final boolean FLIP_NORMALS = true;
-
-    // ------------ 업라이트 보정 설정 (URDF/STL -> Minecraft, "고정 회전") ------------
-    /** URDF/STL 소스 좌표계 가정 */
-    private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1); // 보통 Z-up (ROS)
-    private static final Vector3f SRC_FWD = new Vector3f(1, 0, 0); // 보통 +X forward (ROS)
-
-    /** Minecraft 타깃 좌표계 (Up=+Y, Forward=±Z) */
-    private static final boolean FORWARD_NEG_Z = true;
-    private static final Vector3f DST_UP  = new Vector3f(0, 1, 0);
-    private static final Vector3f DST_FWD = FORWARD_NEG_Z ? new Vector3f(0, 0, -1)
-            : new Vector3f(0, 0,  1);
-
-    /** 루트에서 1회만 적용하는 업라이트 보정 */
-    private static final Quaternionf Q_ROS2MC = makeUprightQuat(SRC_UP, SRC_FWD, DST_UP, DST_FWD);
-
-    // ============================
-    // Tracking Space -> URDF Base Space 변환 ("입력 변환")
-    // ============================
+    private static final boolean DEBUG_MODE = false;
 
     /**
-     * 트래킹 좌표계(VMC)에서 들어온 포즈를 URDF base 좌표계로 바꾸는 기저변환(3x3).
-     * - 기본: Identity (변환 없음)
-     * - 반사(미러, det=-1)도 가능 (좌/우 반전 문제를 여기서 해결 가능)
+     * Manual joint locks are persistent by default. Set to a positive value to auto-release after the
+     * specified duration in milliseconds, or to 0 to disable locking while still stamping ownership.
      */
-    private final Matrix3f M_TRACKING_TO_URDF = new Matrix3f().identity();
-    private final Matrix3f M_URDF_TO_TRACKING = new Matrix3f().identity();
+    private static final long MANUAL_LOCK_DURATION_MS = -1L;
 
-    /** position 스케일 보정(예: meter 기반이면 1.0 그대로) */
-    private float trackingPosScale = 1.0f;
+    // ROS → Minecraft 좌표계 보정
+    private static final Vector3f SRC_UP  = new Vector3f(0, 0, 1);
+    private static final Vector3f SRC_FWD = new Vector3f(1, 0, 0);
+    private static final Vector3f DST_UP  = new Vector3f(0, 1, 0);
+    private static final Vector3f DST_FWD = new Vector3f(0, 0, -1);
+    private static final Quaternionf Q_ROS2MC = makeUprightQuat(SRC_UP, SRC_FWD, DST_UP, DST_FWD);
+
+    // VMD ↔ URDF 조인트 이름 매핑
+    private final Map<String, String> jointNameMapping = new HashMap<>();
+    private boolean jointMappingInitialized = false;
+
+    private final Map<String, JointControlState> jointControlStates = new ConcurrentHashMap<>();
+
+    /**
+     * Control source priorities. GUI manual control always wins until released.
+     */
+    public enum JointControlSource {
+        RL,
+        VMD,
+        GUI,
+        OTHER
+    }
+
+    private static final class JointControlState {
+        private boolean manualLocked = false;
+        private long manualLockExpiresAt = 0L;
+
+        boolean isManualLocked() {
+            if (!manualLocked) {
+                return false;
+            }
+            if (manualLockExpiresAt > 0 && System.currentTimeMillis() > manualLockExpiresAt) {
+                manualLocked = false;
+            }
+            return manualLocked;
+        }
+
+        void markManualLocked() {
+            manualLocked = true;
+            if (MANUAL_LOCK_DURATION_MS > 0) {
+                manualLockExpiresAt = System.currentTimeMillis() + MANUAL_LOCK_DURATION_MS;
+            } else if (MANUAL_LOCK_DURATION_MS == 0) {
+                manualLocked = false;
+                manualLockExpiresAt = 0L;
+            } else {
+                manualLockExpiresAt = -1L;
+            }
+        }
+
+        void clearManualLock() {
+            manualLocked = false;
+            manualLockExpiresAt = 0L;
+        }
+
+        void clearManualLockIfExpired() {
+            if (manualLocked && manualLockExpiresAt > 0 && System.currentTimeMillis() > manualLockExpiresAt) {
+                clearManualLock();
+            }
+        }
+    }
+
+    // ========================================================================
+    // 생성자 / 초기화
+    // ========================================================================
 
     public URDFModelOpenGLWithSTL(URDFModel robotModel, String modelDir) {
         this.robotModel = robotModel;
         this.modelDir = modelDir;
-        logger.info("=== URDF renderer Created ===");
-        loadAllMeshes();
 
-        // (선택) 기본 프리셋: VMC/Unity -> ROS(URDF base) 변환을 원하면 켜두면 편함
-        // setTrackingBasisPreset_VMC_UnityToROS();
+        initJointNameMapping();
+
+        // 물리 모드 켜서 컨트롤러 생성 (ODE4J + BlockCollisionManager 사용)
+        this.controller = new URDFSimpleController(
+                robotModel,
+                robotModel.joints,
+                true,
+                jointNameMapping
+        );
+
+        logger.info("=== URDFSimpleController created (physics mode: {}) ===",
+                controller.isUsingPhysics());
+
+        logger.info("=== URDF renderer Created (Scale: {}) ===", GLOBAL_SCALE);
+
+        loadAllMeshes();
+        // STL 기반 groundOffset 보정은 제거 (물리/렌더 좌표 일치시키기 위함)
+        // calculateGroundOffset();
     }
 
+    /**
+     * STL 메쉬를 전부 미리 로드
+     */
     private void loadAllMeshes() {
         logger.info("=== Loading STL meshes ===");
         int loadedCount = 0;
+
         for (URDFLink link : robotModel.links) {
             if (link.visual != null && link.visual.geometry != null) {
                 URDFLink.Geometry g = link.visual.geometry;
@@ -99,203 +151,367 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                     if (f.exists()) {
                         STLLoader.STLMesh mesh = STLLoader.load(g.meshFilename);
                         if (mesh != null) {
-                            if (g.scale != null && (g.scale.x != 1f || g.scale.y != 1f || g.scale.z != 1f)) {
+                            // URDF 내 scale 적용
+                            if (g.scale != null &&
+                                    (g.scale.x != 1f || g.scale.y != 1f || g.scale.z != 1f)) {
                                 STLLoader.scaleMesh(mesh, g.scale);
                             }
                             meshCache.put(link.name, mesh);
                             loadedCount++;
-                            logger.info("  ✓ Loaded mesh for '{}': {} tris", link.name, mesh.getTriangleCount());
-                        } else {
-                            logger.error("  ✗ Failed to load mesh: {}", g.meshFilename);
                         }
-                    } else {
-                        logger.warn("  ✗ Mesh file not found: {}", g.meshFilename);
                     }
                 }
             }
         }
-        logger.info("=== STL Loading Complete: {}/{} meshes ===", loadedCount, robotModel.getLinkCount());
+
+        logger.info("=== STL Loading Complete: {}/{} meshes ===",
+                loadedCount, robotModel.getLinkCount());
     }
 
-    // ===== 틱 업데이트 (20Hz 권장) =====
-    public void tickUpdate(float dt) {
-        // 현재 버전에서는 컨트롤러 로직이 외부(PosePipeline/MotionEditorScreen)로 이동되어 빈 메서드일 수 있음
-    }
-
-    // ===== 외부 제어용 =====
-    public void setJointTarget(String name, float value) { /* 제어 로직 제거됨 */ }
-    public void setJointTargets(Map<String, Float> values) { /* 제어 로직 제거됨 */ }
-
-    /** 즉시 반영(프리뷰): 현재 프레임에서 바로 보이게 currentPosition을 덮어씀 */
-    public void setJointPreview(String name, float value) {
-        URDFJoint j = getJointByName(name);
-        if (j != null) j.currentPosition = value;
-    }
-
-    // ============================
-    // Tracking(VMC) -> URDF 변환 API
-    // ============================
+    // ========================================================================
+    // 조인트 이름 매핑
+    // ========================================================================
 
     /**
-     * 트래킹->URDF base 기저 설정.
-     * R' = B * R * B^-1, p' = B * p * scale
+     * VMD 스타일 이름을 URDF 조인트 이름과 매핑
      */
-    public synchronized void setTrackingToUrdfBasis(Matrix3fc basisTrackingToUrdf) {
-        if (basisTrackingToUrdf == null) {
-            M_TRACKING_TO_URDF.identity();
-            M_URDF_TO_TRACKING.identity();
-            return;
-        }
-        M_TRACKING_TO_URDF.set(basisTrackingToUrdf);
-        M_URDF_TO_TRACKING.set(basisTrackingToUrdf).invert();
-    }
+    private void initJointNameMapping() {
+        logger.info("=== Initializing Joint Name Mapping ===");
 
-    public synchronized void setTrackingPositionScale(float scale) {
-        this.trackingPosScale = scale;
-    }
+        Map<String, String[]> vmdToUrdfCandidates = new HashMap<>();
+        vmdToUrdfCandidates.put("head_pan",     new String[]{"head_pan", "HeadYaw", "head_yaw", "Neck", "neck"});
+        vmdToUrdfCandidates.put("head_tilt",    new String[]{"head_tilt", "HeadPitch", "head_pitch", "Head", "head"});
+        vmdToUrdfCandidates.put("l_sho_pitch",  new String[]{"l_sho_pitch", "LShoulderPitch", "l_shoulder_pitch"});
+        vmdToUrdfCandidates.put("l_sho_roll",   new String[]{"l_sho_roll", "LShoulderRoll",  "l_shoulder_roll"});
+        vmdToUrdfCandidates.put("l_el",         new String[]{"l_el", "LElbowYaw", "l_elbow", "LElbowRoll"});
+        vmdToUrdfCandidates.put("r_sho_pitch",  new String[]{"r_sho_pitch", "RShoulderPitch", "r_shoulder_pitch"});
+        vmdToUrdfCandidates.put("r_sho_roll",   new String[]{"r_sho_roll", "RShoulderRoll",  "r_shoulder_roll"});
+        vmdToUrdfCandidates.put("r_el",         new String[]{"r_el", "RElbowYaw", "r_elbow", "RElbowRoll"});
+        vmdToUrdfCandidates.put("l_hip_pitch",  new String[]{"l_hip_pitch", "LHipPitch", "LeftHipPitch"});
+        vmdToUrdfCandidates.put("r_hip_pitch",  new String[]{"r_hip_pitch", "RHipPitch", "RightHipPitch"});
 
-    /**
-     * VMC(VirtualMotionCapture=Unity 좌표계)에서 자주 쓰는 기본 프리셋.
-     *
-     * Unity(VMC) 축: X=Right, Y=Up, Z=Forward
-     * ROS/URDF base 축(관례): X=Forward, Y=Left, Z=Up
-     *
-     * 따라서:
-     *   x_ros =  z_unity
-     *   y_ros = -x_unity
-     *   z_ros =  y_unity
-     */
-    public void setTrackingBasisPreset_VMC_UnityToROS() {
-        Matrix3f b = new Matrix3f();
-        // setRow(row, x, y, z)
-        b.setRow(0, 0f, 0f,  1f); // x_ros
-        b.setRow(1, -1f, 0f, 0f); // y_ros
-        b.setRow(2, 0f,  1f, 0f); // z_ros
-        setTrackingToUrdfBasis(b);
-    }
-
-    /**
-     * tracking rotation -> URDF rotation
-     * R' = B * R * B^-1
-     */
-    public Quaternionf trackingRotToUrdf(Quaternionf trackingRot, Quaternionf out) {
-        if (out == null) out = new Quaternionf();
-        if (trackingRot == null) return out.identity();
-
-        Matrix3f B, Binv;
-        float _scale;
-        synchronized (this) {
-            B = new Matrix3f(M_TRACKING_TO_URDF);
-            Binv = new Matrix3f(M_URDF_TO_TRACKING);
-            _scale = trackingPosScale; // (unused here) keep for symmetry
-        }
-
-        Matrix3f R = new Matrix3f().set(trackingRot);
-        Matrix3f R2 = B.mul(R, new Matrix3f()).mul(Binv);
-
-        out.setFromUnnormalized(R2).normalize();
-        return out;
-    }
-
-    /**
-     * tracking position -> URDF position
-     * p' = B * p * scale
-     */
-    public Vector3f trackingPosToUrdf(Vector3f trackingPos, Vector3f out) {
-        if (out == null) out = new Vector3f();
-        if (trackingPos == null) return out.zero();
-
-        Matrix3f B;
-        float s;
-        synchronized (this) {
-            B = new Matrix3f(M_TRACKING_TO_URDF);
-            s = trackingPosScale;
-        }
-
-        out.set(trackingPos);
-        B.transform(out);
-        out.mul(s);
-        return out;
-    }
-
-    // ============================
-    // Joint dump API (요청사항)
-    // ============================
-
-    /**
-     * 현재 관절 상태를 라디안 기준으로 뽑아옵니다.
-     * - REVOLUTE / CONTINUOUS만 포함 (rad)
-     * - PRISMATIC 제외 (meter 단위라 rad 아님)
-     */
-    public Map<String, Float> getJointPositionsRad() {
-        if (robotModel == null || robotModel.joints == null) return Collections.emptyMap();
-        Map<String, Float> out = new LinkedHashMap<>(robotModel.joints.size());
-        fillJointPositionsRad(out);
-        return out;
-    }
-
-    /** 재사용 가능한 out 맵에 라디안 관절만 채움(할당 최소화) */
-    public void fillJointPositionsRad(Map<String, Float> out) {
-        if (out == null) return;
-        out.clear();
-        if (robotModel == null || robotModel.joints == null) return;
-
-        for (URDFJoint j : robotModel.joints) {
-            if (j == null || j.name == null) continue;
-            switch (j.type) {
-                case REVOLUTE:
-                case CONTINUOUS:
-                    out.put(j.name, j.currentPosition);
-                    break;
-                default:
-                    break;
+        for (Map.Entry<String, String[]> entry : vmdToUrdfCandidates.entrySet()) {
+            String vmdName = entry.getKey();
+            for (String candidate : entry.getValue()) {
+                for (URDFJoint j : robotModel.joints) {
+                    if (j.name.equals(candidate) || j.name.equalsIgnoreCase(candidate)) {
+                        jointNameMapping.put(vmdName, j.name);
+                        logger.info("  Mapped: '{}' -> '{}'", vmdName, j.name);
+                        break;
+                    }
+                }
+                if (jointNameMapping.containsKey(vmdName)) break;
             }
         }
+
+        jointMappingInitialized = true;
+        logger.info("=== Joint Mapping Complete: {} mappings ===", jointNameMapping.size());
     }
 
-    /** (선택) movable 전부 포함: revolute(rad) + prismatic(m) */
-    public Map<String, Float> getJointPositionsAll() {
-        if (robotModel == null || robotModel.joints == null) return Collections.emptyMap();
-        Map<String, Float> out = new LinkedHashMap<>(robotModel.joints.size());
-        for (URDFJoint j : robotModel.joints) {
-            if (j == null || j.name == null) continue;
-            if (j.isMovable()) out.put(j.name, j.currentPosition);
+    // ========================================================================
+    // 업데이트 / 월드 컨텍스트
+    // ========================================================================
+
+    /**
+     * 구버전 호환용 단순 업데이트 (월드 정보 없음)
+     */
+    public void tickUpdate(float dt) {
+        tickUpdate(dt, null);
+    }
+
+    /**
+     * 월드/엔티티 정보 함께 전달하는 버전
+     */
+    public void tickUpdate(float dt, Entity entity) {
+        if (controller != null) {
+            if (entity != null) {
+                controller.setWorldContext(entity.level(), entity.position());
+            }
+            controller.update(dt);
         }
-        return out;
     }
 
-    // ============================
-    // Render
-    // ============================
+    // ========================================================================
+    // 조인트 제어 유틸
+    // ========================================================================
+
+    private String resolveJointName(String name) {
+        if (name == null) return null;
+
+        // 1차: VMD → URDF 매핑
+        String mappedName = jointNameMapping.getOrDefault(name, name);
+
+        // 컨트롤러에 실제 존재하는지 확인
+        if (controller.hasJoint(mappedName)) {
+            return mappedName;
+        }
+
+        // 매핑 이름이 없으면 원래 이름도 한 번 더 체크
+        if (!mappedName.equals(name) && controller.hasJoint(name)) {
+            return name;
+        }
+
+        // 대소문자 무시 검색
+        String found = controller.findJointIgnoreCase(name);
+        if (found != null) return found;
+
+        return null;
+    }
+
+    public void setJointTarget(String name, float value) {
+        setJointTarget(name, value, JointControlSource.OTHER);
+    }
+
+    public void setJointTarget(String name, float value, JointControlSource source) {
+        if (controller == null) return;
+
+        String resolvedName = resolveJointName(name);
+        if (resolvedName != null) {
+            if (!canApplyJointTarget(resolvedName, source)) {
+                if (DEBUG_MODE && renderCount < 5) {
+                    logger.debug("✗ Joint '{}' target blocked by manual lock (source={})", resolvedName, source);
+                }
+                return;
+            }
+            controller.setTarget(resolvedName, value);
+            updateJointControlState(resolvedName, source);
+        } else if (DEBUG_MODE && renderCount < 5) {
+            logger.warn("✗ Joint NOT FOUND: '{}'", name);
+        }
+    }
+
+    public void setJointTargets(Map<String, Float> values) {
+        setJointTargets(values, JointControlSource.OTHER);
+    }
+
+    public void setJointTargets(Map<String, Float> values, JointControlSource source) {
+        if (values == null) return;
+        for (Map.Entry<String, Float> entry : values.entrySet()) {
+            setJointTarget(entry.getKey(), entry.getValue(), source);
+        }
+    }
+
+    public void setManualJointTarget(String name, float value) {
+        setJointPreview(name, value, JointControlSource.GUI);
+        setJointTarget(name, value, JointControlSource.GUI);
+    }
+
+    public void releaseManualJointLock(String name) {
+        String resolvedName = resolveJointName(name);
+        if (resolvedName == null) {
+            resolvedName = name;
+        }
+        JointControlState state = jointControlStates.get(resolvedName);
+        if (state != null) {
+            state.clearManualLock();
+        }
+    }
+
+    public void clearManualJointLocks() {
+        jointControlStates.values().forEach(JointControlState::clearManualLock);
+    }
+
+    public boolean isJointLockedByManual(String name) {
+        String resolvedName = resolveJointName(name);
+        if (resolvedName == null) {
+            resolvedName = name;
+        }
+        JointControlState state = jointControlStates.get(resolvedName);
+        return state != null && state.isManualLocked();
+    }
+
+    public boolean hasManualJointLocks() {
+        for (JointControlState state : jointControlStates.values()) {
+            if (state.isManualLocked()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean canApplyJointTarget(String resolvedName, JointControlSource source) {
+        if (source == JointControlSource.GUI) {
+            return true;
+        }
+        JointControlState state = jointControlStates.get(resolvedName);
+        if (state == null) {
+            return true;
+        }
+        return !state.isManualLocked();
+    }
+
+    private void updateJointControlState(String resolvedName, JointControlSource source) {
+        JointControlState state = jointControlStates.computeIfAbsent(resolvedName, key -> new JointControlState());
+        if (source == JointControlSource.GUI) {
+            state.markManualLocked();
+            return;
+        }
+        state.clearManualLockIfExpired();
+    }
+
+    public void setJointVelocity(String name, float velocity) {
+        if (controller == null) return;
+        String resolvedName = resolveJointName(name);
+        if (resolvedName != null) {
+            controller.setTargetVelocity(resolvedName, velocity);
+        }
+    }
+
+    public void setJointPreview(String name, float value) {
+        setJointPreview(name, value, JointControlSource.OTHER);
+    }
+
+    public void setJointPreview(String name, float value, JointControlSource source) {
+        if (controller == null) return;
+        String resolvedName = resolveJointName(name);
+        if (resolvedName == null) {
+            return;
+        }
+
+        if (source != JointControlSource.GUI) {
+            JointControlState state = jointControlStates.get(resolvedName);
+            if (state != null && state.isManualLocked()) {
+                if (DEBUG_MODE && renderCount < 5) {
+                    logger.debug("✗ Joint '{}' preview blocked by manual lock (source={})", resolvedName, source);
+                }
+                return;
+            }
+        }
+
+        controller.setPreviewPosition(resolvedName, value);
+
+        if (source == JointControlSource.GUI) {
+            JointControlState state = jointControlStates.computeIfAbsent(resolvedName, key -> new JointControlState());
+            state.markManualLocked();
+        }
+    }
+
+    public float getJointVelocity(String jointName) {
+        if (controller == null) return 0f;
+        String resolvedName = resolveJointName(jointName);
+        return resolvedName != null ? controller.getJointVelocity(resolvedName) : 0f;
+    }
+
+    public List<String> getMovableJointNames() {
+        return controller != null ? controller.getMovableJointNames() : Collections.emptyList();
+    }
+
+    public float[] getJointLimits(String jointName) {
+        if (controller == null) return new float[]{(float) -Math.PI, (float) Math.PI};
+        String resolvedName = resolveJointName(jointName);
+        return resolvedName != null
+                ? controller.getJointLimits(resolvedName)
+                : new float[]{(float) -Math.PI, (float) Math.PI};
+    }
+
+    public float getJointPosition(String jointName) {
+        if (controller == null) return 0f;
+        String resolvedName = resolveJointName(jointName);
+        return resolvedName != null ? controller.getJointPosition(resolvedName) : 0f;
+    }
+
+    public Map<String, Float> getAllJointPositions() {
+        return controller != null ? controller.getAllJointPositions() : Collections.emptyMap();
+    }
+
+    public Set<String> getJointNames() {
+        return controller != null ? controller.getJointNameSet() : Collections.emptySet();
+    }
+
+    public void printAllJoints() {
+        logger.info("=== Joint Name Mappings ({}) ===", jointNameMapping.size());
+        for (Map.Entry<String, String> entry : jointNameMapping.entrySet()) {
+            logger.info("  - '{}' -> '{}'", entry.getKey(), entry.getValue());
+        }
+    }
+
+    // ========================================================================
+    // 물리 사용 여부 / 컨트롤러 접근
+    // ========================================================================
+
+    public boolean isUsingPhysics() {
+        return controller != null && controller.isUsingPhysics();
+    }
+
+    public URDFSimpleController getController() {
+        return controller;
+    }
+
+    public URDFModel getRobotModel() {
+        return robotModel;
+    }
+
+    // ========================================================================
+    // 렌더링
+    // ========================================================================
 
     @Override
     public void Render(Entity entityIn, float entityYaw, float entityPitch,
                        Vector3f entityTrans, float tickDelta, PoseStack poseStack, int packedLight) {
 
         renderCount++;
+
+        // 컨트롤러에 월드 컨텍스트 전달 (블록 충돌/물리에서 사용)
+        if (controller != null && entityIn != null) {
+            Level level = entityIn.level();
+            Vec3 worldPos = entityIn.position();
+            controller.setWorldContext(level, worldPos);
+        }
+
         if (renderCount % 120 == 1) {
-            logger.info("=== URDF RENDER #{} ===", renderCount);
+            logger.info("=== URDF RENDER #{} (Scale: {}, Physics: {}) ===",
+                    renderCount, GLOBAL_SCALE, isUsingPhysics());
         }
 
         RenderSystem.enableBlend();
         RenderSystem.defaultBlendFunc();
         RenderSystem.enableDepthTest();
-        RenderSystem.disableCull(); // 양면
+        RenderSystem.disableCull();
 
-        MultiBufferSource.BufferSource bufferSource = Minecraft.getInstance().renderBuffers().bufferSource();
+        MultiBufferSource.BufferSource bufferSource =
+                Minecraft.getInstance().renderBuffers().bufferSource();
         VertexConsumer vc = bufferSource.getBuffer(RenderType.solid());
 
         if (robotModel.rootLinkName != null) {
             poseStack.pushPose();
 
-            // 전역 스케일
-            poseStack.scale(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
+            Vector3f rootOffset = entityTrans != null ? new Vector3f(entityTrans) : new Vector3f();
+            if (controller != null) {
+                if (controller.isUsingPhysics()) {
+                    Vec3 baseWorldPos = entityIn != null ? entityIn.position() : null;
+                    float[] rootLocal = controller.getRootLinkLocalPosition(baseWorldPos);
+                    if (rootLocal != null && rootLocal.length >= 3) {
+                        rootOffset.add(rootLocal[0], rootLocal[1], rootLocal[2]);
+                    }
+                }
+            }
 
-            // ★ 루트에만 업라이트 보정 적용 (고정 회전)
+            poseStack.translate(rootOffset.x(), rootOffset.y(), rootOffset.z());
+
+            // ✅ PATCH: 물리 루트 바디 회전(roll/pitch 포함)을 렌더에 반영
+            if (controller != null && controller.isUsingPhysics()) {
+                float[] qWxyz = controller.getRootBodyWorldQuaternionWXYZ();
+                if (qWxyz != null && qWxyz.length >= 4) {
+                    float w = qWxyz[0];
+                    float x = qWxyz[1];
+                    float y = qWxyz[2];
+                    float z = qWxyz[3];
+
+                    if (Float.isFinite(w) && Float.isFinite(x) && Float.isFinite(y) && Float.isFinite(z)) {
+                        // JOML Quaternionf는 (x,y,z,w) 순서
+                        Quaternionf qPhys = new Quaternionf(x, y, z, w).normalize();
+                        poseStack.mulPose(qPhys);
+                    }
+                }
+            }
+
+            // ROS → Minecraft 좌표계 회전 (기존 유지)
             poseStack.mulPose(new Quaternionf(Q_ROS2MC));
 
-            renderLinkRecursive(robotModel.rootLinkName, poseStack, vc, packedLight);
+            // 메쉬 스케일
+            poseStack.scale(GLOBAL_SCALE, GLOBAL_SCALE, GLOBAL_SCALE);
 
+            renderLinkRecursive(robotModel.rootLinkName, poseStack, vc, packedLight);
             poseStack.popPose();
         }
 
@@ -303,7 +519,8 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         RenderSystem.enableCull();
     }
 
-    private void renderLinkRecursive(String linkName, PoseStack poseStack, VertexConsumer vc, int packedLight) {
+    private void renderLinkRecursive(String linkName, PoseStack poseStack,
+                                     VertexConsumer vc, int packedLight) {
         URDFLink link = robotModel.getLink(linkName);
         if (link == null) return;
 
@@ -323,7 +540,8 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         poseStack.popPose();
     }
 
-    private void renderVisual(URDFLink link, PoseStack poseStack, VertexConsumer vc, int packedLight) {
+    private void renderVisual(URDFLink link, PoseStack poseStack,
+                              VertexConsumer vc, int packedLight) {
         if (link.visual == null || link.visual.geometry == null) return;
 
         poseStack.pushPose();
@@ -336,26 +554,25 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         if (mesh != null) {
             renderMesh(mesh, link, poseStack, vc, packedLight);
         }
+
         poseStack.popPose();
     }
 
-    private void renderMesh(STLLoader.STLMesh mesh, URDFLink link, PoseStack poseStack,
-                            VertexConsumer vc, int packedLight) {
+    private void renderMesh(STLLoader.STLMesh mesh, URDFLink link,
+                            PoseStack poseStack, VertexConsumer vc, int packedLight) {
         Matrix4f matrix = poseStack.last().pose();
 
         int r = 220, g = 220, b = 220, a = 255;
         if (link.visual.material != null && link.visual.material.color != null) {
             URDFLink.Material.Vector4f color = link.visual.material.color;
-            r = (int)(color.x * 255);
-            g = (int)(color.y * 255);
-            b = (int)(color.z * 255);
-            a = (int)(color.w * 255);
+            r = (int) (color.x * 255);
+            g = (int) (color.y * 255);
+            b = (int) (color.z * 255);
+            a = (int) (color.w * 255);
         }
 
-        int blockLight = (packedLight & 0xFFFF);
-        int skyLight   = (packedLight >> 16) & 0xFFFF;
-        blockLight = Math.max(blockLight, 0xA0);
-        skyLight  = Math.max(skyLight,  0xA0);
+        int blockLight = Math.max((packedLight & 0xFFFF), 0xA0);
+        int skyLight   = Math.max((packedLight >> 16) & 0xFFFF, 0xA0);
 
         for (STLLoader.Triangle tri : mesh.triangles) {
             for (int i = 2; i >= 0; i--) {
@@ -375,9 +592,9 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         }
     }
 
-    // ============================
-    // Transform helpers
-    // ============================
+    // ========================================================================
+    // 변환 유틸
+    // ========================================================================
 
     private void applyLinkOriginTransform(URDFLink.Origin origin, PoseStack poseStack) {
         poseStack.translate(origin.xyz.x, origin.xyz.y, origin.xyz.z);
@@ -405,7 +622,6 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         }
     }
 
-    /** 축 기본값/정규화 포함(비었거나 0-벡터면 X축) */
     private void applyJointMotion(URDFJoint joint, PoseStack poseStack) {
         if (joint == null) return;
 
@@ -421,7 +637,8 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                     if (axis.lengthSquared() < 1e-12f) axis.set(1, 0, 0);
                     else axis.normalize();
                 }
-                Quaternionf quat = new Quaternionf().rotateAxis(joint.currentPosition, axis.x, axis.y, axis.z);
+                Quaternionf quat = new Quaternionf()
+                        .rotateAxis(joint.currentPosition, axis.x, axis.y, axis.z);
                 poseStack.mulPose(quat);
                 break;
             }
@@ -432,7 +649,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
                     axis = new Vector3f(1, 0, 0);
                 } else {
                     axis = new Vector3f(joint.axis.xyz);
-                    if (axis.lengthSquared() < 1e-12f) axis.set(1, 0, 0);
+                    if (axis.lengthSquard() < 1e-12f) axis.set(1, 0, 0);
                     else axis.normalize();
                 }
                 Vector3f t = axis.mul(joint.currentPosition);
@@ -444,14 +661,30 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         }
     }
 
-    // ============================
-    // IMMDModel
-    // ============================
+    // ========================================================================
+    // IMMDModel 구현
+    // ========================================================================
 
-    @Override public void ChangeAnim(long anim, long layer) { }
-    @Override public void ResetPhysics() { logger.info("ResetPhysics called"); }
-    @Override public long GetModelLong() { return 0; }
-    @Override public String GetModelDir() { return modelDir; }
+    @Override
+    public void ChangeAnim(long anim, long layer) { }
+
+    @Override
+    public void ResetPhysics() {
+        logger.info("ResetPhysics called");
+        if (controller != null) {
+            controller.resetPhysics();
+        }
+    }
+
+    @Override
+    public long GetModelLong() {
+        return 0;
+    }
+
+    @Override
+    public String GetModelDir() {
+        return modelDir;
+    }
 
     public static URDFModelOpenGLWithSTL Create(String urdfPath, String modelDir) {
         File urdfFile = new File(urdfPath);
@@ -461,27 +694,10 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         return new URDFModelOpenGLWithSTL(robot, modelDir);
     }
 
-    public URDFModel getRobotModel() {
-        return robotModel;
-    }
+    // ========================================================================
+    // 업라이트 보정 유틸
+    // ========================================================================
 
-    // ============================
-    // internal
-    // ============================
-
-    private URDFJoint getJointByName(String name) {
-        if (name == null) return null;
-        for (URDFJoint j : robotModel.joints) {
-            if (name.equals(j.name)) return j;
-        }
-        return null;
-    }
-
-    // ============================
-    // Upright utilities
-    // ============================
-
-    /** Up을 먼저 맞추고 → Up에 수직인 평면에서 Forward만 정렬 (롤 꼬임 방지) */
     private static Quaternionf makeUprightQuat(Vector3f srcUp, Vector3f srcFwd,
                                                Vector3f dstUp, Vector3f dstFwd) {
         Vector3f su = new Vector3f(srcUp).normalize();
@@ -489,13 +705,13 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         Vector3f du = new Vector3f(dstUp).normalize();
         Vector3f df = new Vector3f(dstFwd).normalize();
 
-        // 1) Up 정렬
+        // 1) Up 벡터 정렬
         Quaternionf qUp = fromToQuat(su, du);
         Vector3f sf1 = sf.rotate(new Quaternionf(qUp));
 
-        // 2) Up에 수직인 평면에서 Forward 정렬
+        // 2) Up 축에 수직인 평면에서 Forward 정렬
         Vector3f sf1p = new Vector3f(sf1).sub(new Vector3f(du).mul(sf1.dot(du)));
-        Vector3f dfp  = new Vector3f(df ).sub(new Vector3f(du).mul(df .dot(du)));
+        Vector3f dfp = new Vector3f(df).sub(new Vector3f(du).mul(df.dot(du)));
         if (sf1p.lengthSquared() < 1e-10f || dfp.lengthSquared() < 1e-10f) {
             return qUp.normalize();
         }
@@ -503,7 +719,7 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         dfp.normalize();
 
         float cos = clamp(sf1p.dot(dfp), -1f, 1f);
-        float angle = (float)Math.acos(cos);
+        float angle = (float) Math.acos(cos);
         Vector3f cross = sf1p.cross(dfp, new Vector3f());
         if (cross.dot(du) < 0) angle = -angle;
 
@@ -516,23 +732,27 @@ public class URDFModelOpenGLWithSTL implements IMMDModel {
         Vector3f v2 = new Vector3f(b).normalize();
         float dot = clamp(v1.dot(v2), -1f, 1f);
 
-        if (dot > 1.0f - 1e-6f) return new Quaternionf();
+        if (dot > 1.0f - 1e-6f) return new Quaternionf(); // 동일
         if (dot < -1.0f + 1e-6f) {
             Vector3f axis = pickAnyPerp(v1).normalize();
-            return new Quaternionf().fromAxisAngleRad(axis, (float)Math.PI);
+            return new Quaternionf().fromAxisAngleRad(axis, (float) Math.PI);
         }
         Vector3f axis = v1.cross(v2, new Vector3f()).normalize();
-        float angle = (float)Math.acos(dot);
+        float angle = (float) Math.acos(dot);
         return new Quaternionf().fromAxisAngleRad(axis, angle);
     }
 
     private static Vector3f pickAnyPerp(Vector3f v) {
-        Vector3f x = new Vector3f(1,0,0), y = new Vector3f(0,1,0), z = new Vector3f(0,0,1);
-        float dx = Math.abs(v.dot(x)), dy = Math.abs(v.dot(y)), dz = Math.abs(v.dot(z));
+        Vector3f x = new Vector3f(1, 0, 0);
+        Vector3f y = new Vector3f(0, 1, 0);
+        Vector3f z = new Vector3f(0, 0, 1);
+        float dx = Math.abs(v.dot(x));
+        float dy = Math.abs(v.dot(y));
+        float dz = Math.abs(v.dot(z));
         return (dx < dy && dx < dz) ? x : ((dy < dz) ? y : z);
     }
 
     private static float clamp(float v, float lo, float hi) {
-        return v < lo ? lo : (v > hi ? hi : v);
+        return v < lo ? lo : (Math.min(v, hi));
     }
 }
